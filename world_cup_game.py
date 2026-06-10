@@ -6,11 +6,25 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import random
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from world_cup_challenger import (
+    QF_PAIR_IDX,
+    SF_PAIR_IDX,
+    WCC_GROUP_LABELS,
+    compute_bracket_state,
+    compute_draw_strength,
+    draw_six_pots_into_groups,
+    get_r16_slots,
+    gs_comp_label,
+    gs_tables_ready,
+    round_robin_single_even,
+    sorted_group_table,
+)
 from world_cup_ratings import load_ovr_overrides, load_world_ranks, ovr_for_team, power_from_ovr
 
 CONFEDS = ["UEFA", "AFC", "CONCACAF", "CAF", "OFC", "CONMEBOL"]
@@ -18,6 +32,16 @@ FINAL_CUPS = ["WORLD-CHAMPIONS", "WORLD-LEAGUE", "WORLD-ASSOCIATION"]
 
 # 单场战力：在球队基准 OVR（JSON/曲线）附近小幅波动；整届大赛内基准不变
 MATCH_OVR_JITTER = 1.35
+
+# OVR 比分模拟参数（有效评分差 → 进球份额 → Poisson 采样）
+OVR_LOW_TIER_AMP = 0.45
+OVR_WEAK_PENALTY = 0.35
+OVR_TOTAL_GOAL_COEFF = 0.085
+OVR_WEAK_EXTRA_GOAL = 0.06
+OVR_TOTAL_GOALS_MIN = 2.05
+OVR_TOTAL_GOALS_MAX = 10.50
+OVR_COLLAPSE_PROB_CAP = 0.45
+OVR_HOME_OVR_PER_POWER = 1.0 / 15.5
 
 # 积分榜划线：(名次下限, 名次上限, 标签) — 用于 UI 展示晋级区间
 TABLE_ZONES: Dict[str, List[Tuple[int, int, str]]] = {
@@ -66,22 +90,21 @@ TABLE_ZONES: Dict[str, List[Tuple[int, int, str]]] = {
         (9, 9, "世界联赛杯附加赛"),
         (10, 10, "世界协会杯附加赛"),
     ],
-    "WORLD-CHAMPIONS": [
-        (1, 8, "16强直接晋级"),
-        (9, 24, "9～24名附加赛"),
-        (25, 36, "未晋级淘汰赛"),
-    ],
-    "WORLD-LEAGUE": [
-        (1, 8, "16强直接晋级"),
-        (9, 24, "9～24名附加赛"),
-        (25, 36, "未晋级淘汰赛"),
-    ],
-    "WORLD-ASSOCIATION": [
-        (1, 8, "16强直接晋级"),
-        (9, 24, "9～24名附加赛"),
-        (25, 36, "未晋级淘汰赛"),
-    ],
 }
+
+_CHALLENGER_GS_ZONES: List[Tuple[int, int, str]] = [
+    (1, 1, "16强直通（小组第一）"),
+    (2, 2, "第二名（S7/S8 槽位：前二均值最优两组）"),
+    (3, 3, "24强附加赛"),
+    (4, 4, "24强附加赛"),
+    (5, 6, "未晋级淘汰赛"),
+]
+for _cup in FINAL_CUPS:
+    for _lab in WCC_GROUP_LABELS:
+        TABLE_ZONES[f"{_cup}-GS-{_lab}"] = _CHALLENGER_GS_ZONES
+TABLE_ZONES["WCC-GS-A"] = _CHALLENGER_GS_ZONES
+for _lab in WCC_GROUP_LABELS[1:]:
+    TABLE_ZONES[f"WCC-GS-{_lab}"] = _CHALLENGER_GS_ZONES
 
 
 def zone_label_for_rank(comp: str, rank: int) -> str:
@@ -243,6 +266,10 @@ def _dedupe_edges(edges: List[Tuple[Team, Team]]) -> List[Tuple[Team, Team]]:
 
 
 def build_pot_league_edges(pots: List[List[Team]]) -> List[Tuple[Team, Team]]:
+    """
+    旧版固定轮转配对（已弃用）：同档内 k 与 k+1 成环、跨档亦为 k/k+1，
+    会导致「档内序号」与对手档内序号强相关。请使用 simulate_uefa_style_league_draw。
+    """
     n_pots = len(pots)
     m = len(pots[0])
     for p in pots:
@@ -262,7 +289,114 @@ def build_pot_league_edges(pots: List[List[Team]]) -> List[Tuple[Team, Team]]:
     return _dedupe_edges(edges)
 
 
+def _count_neighbors_in_pot(adj: Dict[str, Set[str]], name: str, pot_members: Set[str]) -> int:
+    return len(adj[name] & pot_members)
+
+
+def simulate_uefa_style_league_draw(
+    pots: List[List[Team]],
+    rng: random.Random,
+    *,
+    max_attempts: int = 8000,
+) -> Tuple[List[Tuple[Team, Team]], List[Dict[str, Any]], Dict[str, Dict[str, List[str]]]]:
+    """
+    模拟欧冠/欧联/欧协联式「联赛阶段」抽签（本游戏为每档 2 个对手，含同档 2 场）：
+    自最后一档（序号最大、实力最弱档）到第一档，档内按世界排名从低到高（弱队先抽）；
+    对每个抽中的球队，自最低档向最高档依次补足与各档的 2 场对阵；
+    跨档时若某候选队与「本档」的已配对次数已达 2，则不得再抽中（移出池）；
+    同档则在尚未连满 2 场的队友中随机抽选。
+
+    返回：边列表、逐步抽签记录、各队「按档」对手名单（档号 1 为最强档）。
+    """
+    n_pots = len(pots)
+    m = len(pots[0])
+    for p in pots:
+        if len(p) != m:
+            raise ValueError("各档人数必须相同")
+
+    pot_members: List[Set[str]] = [{t.name for t in pot} for pot in pots]
+    pot_of: Dict[str, int] = {}
+    for pi, pot in enumerate(pots):
+        for t in pot:
+            pot_of[t.name] = pi
+
+    base_salt = rng.randrange(1, 10**9)
+
+    def try_once(attempt_rng: random.Random) -> Optional[Tuple[List[Tuple[Team, Team]], List[Dict[str, Any]]]]:
+        adj: Dict[str, Set[str]] = defaultdict(set)
+        steps: List[Dict[str, Any]] = []
+        team_map: Dict[str, Team] = {t.name: t for pot in pots for t in pot}
+
+        draw_order: List[Team] = []
+        for pi in range(n_pots - 1, -1, -1):
+            draw_order.extend(sorted(pots[pi], key=lambda t: t.world_rank, reverse=True))
+
+        for T in draw_order:
+            pi = pot_of[T.name]
+            for pj in range(n_pots - 1, -1, -1):
+                need = 2 - _count_neighbors_in_pot(adj, T.name, pot_members[pj])
+                while need > 0:
+                    cands: List[Team] = []
+                    for C in pots[pj]:
+                        if C.name == T.name:
+                            continue
+                        if C.name in adj[T.name]:
+                            continue
+                        if pi == pj:
+                            if len(adj[C.name] & pot_members[pi]) >= 2:
+                                continue
+                        else:
+                            if _count_neighbors_in_pot(adj, C.name, pot_members[pi]) >= 2:
+                                continue
+                        cands.append(C)
+                    if not cands:
+                        return None
+                    attempt_rng.shuffle(cands)
+                    C = cands[0]
+                    adj[T.name].add(C.name)
+                    adj[C.name].add(T.name)
+                    steps.append(
+                        {
+                            "抽中球队": T.name,
+                            "该队所在档": pi + 1,
+                            "从档抽选": pj + 1,
+                            "对手": C.name,
+                        }
+                    )
+                    need -= 1
+        edges: List[Tuple[Team, Team]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for a in adj:
+            for bn in adj[a]:
+                x, y = sorted([a, bn])
+                if (x, y) in seen:
+                    continue
+                seen.add((x, y))
+                edges.append((team_map[x], team_map[y]))
+        return edges, steps
+
+    last_err: Optional[str] = None
+    for att in range(max_attempts):
+        r2 = random.Random(base_salt + att * 7919)
+        got = try_once(r2)
+        if got is not None:
+            edges, steps = got
+            by_team_pot: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+            for a, b in edges:
+                pa, pb = pot_of[a.name], pot_of[b.name]
+                by_team_pot[a.name][f"{pb + 1}档"].append(b.name)
+                by_team_pot[b.name][f"{pa + 1}档"].append(a.name)
+            flat: Dict[str, Dict[str, List[str]]] = {}
+            for nm, d in by_team_pot.items():
+                flat[nm] = {k: sorted(v) for k, v in sorted(d.items())}
+            return edges, steps, flat
+        last_err = "greedy_dead_end"
+
+    raise RuntimeError(f"联赛阶段抽签多次失败（{last_err}），请更换随机种子或增大 max_attempts")
+
+
 def build_ofc_league_edges(pots: List[List[Team]]) -> List[Tuple[Team, Team]]:
+    """旧版大洋洲固定配对（已弃用；现与其它洲相同使用 simulate_uefa_style_league_draw）。"""
     if len(pots) != 4:
         raise ValueError("OFC 需要 4 档")
     m = len(pots[0])
@@ -438,6 +572,78 @@ def round_robin_double(teams: List[Team], rng: random.Random) -> List[List[Tuple
     return rounds_first + rounds_second
 
 
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _sample_poisson(rng: random.Random, lam: float) -> int:
+    lam = max(0.0, lam)
+    if lam <= 0.0:
+        return 0
+    lim = math.exp(-lam)
+    k = 0
+    p = 1.0
+    while p > lim:
+        k += 1
+        p *= rng.random()
+    return k - 1
+
+
+def _ovr_effective_diff(ra: float, rb: float) -> Tuple[float, float, float, float]:
+    abs_diff = abs(ra - rb)
+    avg = (ra + rb) / 2.0
+    low_team = min(ra, rb)
+    effective_diff = (
+        abs_diff
+        + max(0.0, 70.0 - avg) * OVR_LOW_TIER_AMP
+        + max(0.0, 55.0 - low_team) * OVR_WEAK_PENALTY
+    )
+    return effective_diff, abs_diff, avg, low_team
+
+
+def _ovr_rating_scale(avg: float) -> float:
+    if avg >= 75.0:
+        return 17.0
+    if avg >= 60.0:
+        return 14.0
+    return 11.0
+
+
+def _ovr_match_lambdas(ra: float, rb: float, rng: random.Random) -> Tuple[float, float]:
+    """按 OVR 算法计算两队 Poisson λ；ra/rb 为已含主场等效的 OVR。"""
+    effective_diff, abs_diff, avg, low_team = _ovr_effective_diff(ra, rb)
+    rating_scale = _ovr_rating_scale(avg)
+    strong_share = _sigmoid(effective_diff / rating_scale)
+    weak_share = 1.0 - strong_share
+
+    total_goals = 2.25 + OVR_TOTAL_GOAL_COEFF * max(0.0, effective_diff - 8.0)
+    if low_team < 45.0:
+        total_goals += (45.0 - low_team) * OVR_WEAK_EXTRA_GOAL
+    total_goals = max(OVR_TOTAL_GOALS_MIN, min(OVR_TOTAL_GOALS_MAX, total_goals))
+
+    lam_strong = total_goals * strong_share
+    lam_weak = total_goals * weak_share
+
+    if abs_diff >= 30.0 and low_team <= 45.0:
+        collapse_p = min(OVR_COLLAPSE_PROB_CAP, max(0.0, (abs_diff - 30.0) / 50.0 * OVR_COLLAPSE_PROB_CAP))
+        if rng.random() < collapse_p:
+            lam_strong *= 1.0 + rng.uniform(0.20, 0.65)
+            lam_weak *= max(0.05, 1.0 - rng.uniform(0.25, 0.55))
+
+    if ra >= rb:
+        return lam_strong, lam_weak
+    return lam_weak, lam_strong
+
+
+def _goals_from_ovr(rng: random.Random, home_ovr: float, away_ovr: float) -> Tuple[int, int]:
+    lam_h, lam_a = _ovr_match_lambdas(home_ovr, away_ovr, rng)
+    return _sample_poisson(rng, lam_h), _sample_poisson(rng, lam_a)
+
+
 def _p_win(home: Team, away: Team, home_adv: float = 52.0) -> float:
     d = (home.power + home_adv) - away.power
     return 1.0 / (1.0 + 10 ** (-d / 315.0))
@@ -470,6 +676,8 @@ class Simulator:
         self.draw_log: List[Dict[str, Any]] = []
         self.league_schedule_by_confed: Dict[str, List[List[Tuple[str, str, str, str]]]] = {}
         self.league_play_plan: Dict[str, List[List[Tuple[Team, Team]]]] = {}
+        # 赛事 -> 球队名 -> { "1档": [对手…], … }（联赛阶段模拟抽签后的对阵摘要）
+        self.league_opponents_by_comp: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
         self.qual_slots: Dict[str, List[Team]] = {
             "WC": [], "WC_PO": [], "WL": [], "WL_PO": [], "WA": [], "WA_PO": [],
         }
@@ -478,6 +686,15 @@ class Simulator:
         self._ko_sub: str = ""
         self._last_day_matches: List[Match] = []
         self.cup_champions: Dict[str, str] = {}
+        # 世界挑战者杯（洲内附加赛败者 36 队，与预选赛第二阶段并行）
+        self._wcc_prelim_losers: List[Team] = []
+        self._p1_days_completed: int = 0
+        self._wcc_inject_flags: Dict[str, bool] = {}
+        self._wcc_draw_groups: List[List[Team]] = []
+        self.wcc_champion: str = ""
+        self._cup_draw_groups: Dict[str, List[List[Team]]] = {}
+        self._challenger_bracket_state: Dict[str, Dict[str, Any]] = {}
+        self._challenger_draw_strength: Dict[str, Dict[str, Any]] = {}
 
         self._bootstrap_prelim_and_queue()
 
@@ -582,8 +799,18 @@ class Simulator:
         self.draw_log.append({"type": "prelim_draw", "payload": payload})
         return {"ties": ties, **{k: v for k, v in payload.items() if k != "对阵(种子主场)"}}
 
+    def _prelim_match_winner_team(self, m: Match, a: Team, b: Team) -> Team:
+        if m.winner is not None:
+            return m.winner
+        if m.hg > m.ag:
+            return m.home
+        if m.ag > m.hg:
+            return m.away
+        return a if self.rng.random() < _p_win(a, b, 0.0) else b
+
     def _collect_prelim_winners(self) -> None:
         winners_by_confed: Dict[str, List[Team]] = {}
+        wcc_losers: List[Team] = []
         for confed in CONFEDS:
             if confed == "CONMEBOL":
                 winners_by_confed[confed] = sorted(self._confed_teams(confed), key=lambda t: t.world_rank)
@@ -605,21 +832,20 @@ class Simulator:
                     break
                 if found is None:
                     raise RuntimeError(f"缺少附加赛结果: {confed} {a.name} vs {b.name}")
-                if found.winner is not None:
-                    wset.add(found.winner.name)
-                elif found.hg > found.ag:
-                    wset.add(found.home.name)
-                elif found.ag > found.hg:
-                    wset.add(found.away.name)
-                else:
-                    wset.add(a.name if self.rng.random() < _p_win(a, b, 0.0) else b.name)
+                w_t = self._prelim_match_winner_team(found, a, b)
+                wset.add(w_t.name)
+                loser = b if w_t.name == a.name else a
+                wcc_losers.append(loser)
             winners_by_confed[confed] = [self.team_map[nm] for nm in wset]
-
+        self._wcc_prelim_losers = sorted(wcc_losers, key=lambda t: t.world_rank)
+        if len(self._wcc_prelim_losers) != 36:
+            raise RuntimeError(f"挑战者杯入队应为 36，实际 {len(self._wcc_prelim_losers)}")
         self._build_league_after_prelim(winners_by_confed)
 
     def _build_league_after_prelim(self, winners_by_confed: Dict[str, List[Team]]) -> None:
         self.league_schedule_by_confed = {}
         self.league_play_plan = {}
+        self.league_opponents_by_comp = {}
 
         specs = [
             ("UEFA", 6, "UEFA-QUAL", True),
@@ -639,7 +865,33 @@ class Simulator:
                 {"type": "league_pots", "赛事": comp_label, "大洲": confed, "分档说明": "按世界排名蛇形/顺位入档（1档最强）", "pots": pot_names}
             )
 
-            edges = build_pot_league_edges(pots) if use_standard else build_ofc_league_edges(pots)
+            if use_standard:
+                edges, draw_steps, opp_by_team = simulate_uefa_style_league_draw(pots, self.rng)
+                self.draw_log.append(
+                    {
+                        "type": "league_pairing_draw",
+                        "赛事": comp_label,
+                        "规则说明": "自六档至一档、档内按世界排名从低到高依次抽签；每档抽满 2 个不同对手；"
+                        "跨档时若某队与「当前抽签档」已配对 2 次则不可再抽中。",
+                        "抽签步数": len(draw_steps),
+                        "抽签过程": draw_steps,
+                        "各队对手按档": opp_by_team,
+                    }
+                )
+                self.league_opponents_by_comp[comp_label] = opp_by_team
+            else:
+                edges, draw_steps, opp_by_team = simulate_uefa_style_league_draw(pots, self.rng)
+                self.draw_log.append(
+                    {
+                        "type": "league_pairing_draw",
+                        "赛事": comp_label,
+                        "规则说明": "大洋洲 4 档联赛：与洲内其它联赛相同的模拟抽签（每档 2 对手，共 8 场），自四档至一档、档内弱队先抽。",
+                        "抽签步数": len(draw_steps),
+                        "抽签过程": draw_steps,
+                        "各队对手按档": opp_by_team,
+                    }
+                )
+                self.league_opponents_by_comp[comp_label] = opp_by_team
             # 每档各 2 个对手：6 档 -> 12 场；大洋洲 4 档 -> 8 场
             deg = n_pots * 2 if use_standard else 8
             _verify_regular(edges, teams, deg)
@@ -720,8 +972,331 @@ class Simulator:
                     )
             all_days.append(day_list)
 
+        # 世界挑战者杯：前 5 个预选赛比赛日与小组赛同步；之后附加赛/淘汰赛按轮次注入
+        self._p1_days_completed = 0
+        self._wcc_inject_flags = {k: False for k in ("po", "r16", "qf", "sf", "fin")}
+        self._wcc_draw_groups = []
+        self.wcc_champion = ""
+        wcc_gs = self._wcc_build_group_stage_matches(self._wcc_prelim_losers)
+        for r in range(min(5, len(all_days))):
+            all_days[r].extend(wcc_gs[r])
+
         self.phase_matchdays = all_days
-        self.phase_name = "第二阶段：洲内联赛（每轮一个比赛日，每队总场次相同）"
+        self.phase_name = "第二阶段：洲内联赛（每轮一个比赛日，每队总场次相同）+ 世界挑战者杯"
+
+    def _challenger_build_group_stage(
+        self, comp_prefix: str, teams36: List[Team], *, log_type: str, log_note: str
+    ) -> List[List[Match]]:
+        groups, pot_names = draw_six_pots_into_groups(teams36, self.rng)
+        if comp_prefix == "WCC":
+            self._wcc_draw_groups = groups
+        else:
+            self._cup_draw_groups[comp_prefix] = groups
+        draw_strength = compute_draw_strength(groups, self.rng)
+        self._challenger_draw_strength[comp_prefix] = draw_strength
+        self.draw_log.append(
+            {
+                "type": log_type,
+                "赛事": comp_prefix,
+                "说明": log_note,
+                "分档": {f"第{i + 1}档": names for i, names in enumerate(pot_names)},
+                "分组": {WCC_GROUP_LABELS[i]: [t.name for t in g] for i, g in enumerate(groups)},
+                "组硬度(抽签后锁定)": draw_strength["second_strength_log"],
+                "小组第四对阵组(前四均值最弱四组)": draw_strength["fourth_t_groups"],
+                "小组第四交叉组(余下两组)": draw_strength["fourth_3rd_groups"],
+                "24强附加赛签位(赛前锁定)": [
+                    f"{s}: {a} vs {b}" for s, a, b in draw_strength["playoff_slot_defs"]
+                ],
+                "16强签表(算法生成)": [
+                    f"{s}: {l} vs {r}胜者" for s, l, r in draw_strength["r16_slots"]
+                ],
+                "16强落位详情": draw_strength.get("bracket_layout_log", []),
+                "S7直通小组": draw_strength["s7_group"],
+                "S8直通小组": draw_strength["s8_group"],
+                "前四均值排序": draw_strength["fourth_strength_log"],
+                "说明_组硬度": "S7/S8：各组一档+二档世界排名均值最优的两组；T对阵第四：各组一至四档均值最弱的四组（分组抽签结束时锁定）",
+                "说明_淘汰赛签表": "S7/S8分上下半区且各对阵P1-4；小组第一对阵P5-8；同半区回避+尽量16强不同组",
+            }
+        )
+        by_round: List[List[Match]] = [[] for _ in range(5)]
+        for gi, grp in enumerate(groups):
+            lab = WCC_GROUP_LABELS[gi]
+            comp = gs_comp_label(comp_prefix, lab)
+            rnds = round_robin_single_even(grp, self.rng)
+            for ri, pairs in enumerate(rnds):
+                for hi, ai in pairs:
+                    by_round[ri].append(
+                        Match(
+                            comp=comp,
+                            stage=f"小组赛·组{lab}·第{ri + 1}轮",
+                            day=0,
+                            round_num=ri + 1,
+                            home=hi,
+                            away=ai,
+                            kind="league",
+                            neutral=True,
+                        )
+                    )
+        return by_round
+
+    def _wcc_build_group_stage_matches(self, teams36: List[Team]) -> List[List[Match]]:
+        return self._challenger_build_group_stage(
+            "WCC",
+            teams36,
+            log_type="wcc_group_draw",
+            log_note="洲内附加赛败者 36 队；6 组单循环 5 轮中立场地；24 强积分种子附加赛制",
+        )
+
+    def _challenger_refresh_bracket_state(self, comp_prefix: str) -> Dict[str, Any]:
+        groups = self._wcc_draw_groups if comp_prefix == "WCC" else self._cup_draw_groups[comp_prefix]
+        draw_strength = self._challenger_draw_strength.get(comp_prefix)
+        state = compute_bracket_state(
+            groups, self.team_map, self.tables, comp_prefix, self.rng, draw_strength=draw_strength
+        )
+        self._challenger_bracket_state[comp_prefix] = state
+        return state
+
+    def _challenger_po_winner(self, comp_prefix: str, slot: str) -> Team:
+        for m in reversed(self.all_results):
+            if m.comp != f"{comp_prefix}-PO" or not m.played:
+                continue
+            if slot not in m.stage:
+                continue
+            if m.winner is not None:
+                return m.winner
+            if m.hg > m.ag:
+                return m.home
+            if m.ag > m.hg:
+                return m.away
+            return m.home if m.home.world_rank < m.away.world_rank else m.away
+        raise RuntimeError(f"缺少 {comp_prefix} 24强附加赛结果 {slot}")
+
+    def _challenger_ko_winners_by_round(self, comp_prefix: str, stage_prefix: str, n: int) -> List[Team]:
+        ms = [
+            m
+            for m in self._last_day_matches
+            if m.comp == f"{comp_prefix}-KO" and m.stage.startswith(stage_prefix) and m.played
+        ]
+        if len(ms) < n:
+            all_ms = [
+                m
+                for m in self.all_results
+                if m.comp == f"{comp_prefix}-KO" and m.stage.startswith(stage_prefix) and m.played
+            ]
+            if all_ms:
+                last_day = max(m.day for m in all_ms)
+                ms = [m for m in all_ms if m.day == last_day]
+        ms.sort(key=lambda x: x.round_num)
+        if len(ms) != n:
+            raise RuntimeError(f"{comp_prefix} {stage_prefix} 胜者数量异常：期望 {n}，实际 {len(ms)}")
+        out: List[Team] = []
+        for m in ms:
+            w = m.winner
+            if w is None:
+                w = m.home if m.hg > m.ag else m.away
+            out.append(w)
+        return out
+
+    def _challenger_build_po_matches(self, comp_prefix: str) -> List[Match]:
+        if not gs_tables_ready(comp_prefix, self.tables):
+            raise RuntimeError(f"{comp_prefix} 小组积分榜未就绪，无法开始 24 强附加赛")
+        state = self._challenger_refresh_bracket_state(comp_prefix)
+        self.draw_log.append(
+            {
+                "type": f"{comp_prefix.lower()}_bracket_draw",
+                "赛事": comp_prefix,
+                "组硬度排序(S7/S8)": state["second_strength_log"],
+                "小组第四角色": state["fourth_strength_log"],
+                "最弱四组(第四打T)": state["fourth_t_groups"],
+                "S7": state["S7"].name,
+                "S7来自小组": state["S7_group"],
+                "S8": state["S8"].name,
+                "S8来自小组": state["S8_group"],
+                "T1-T4": [state["placements"][f"T{i}"].name for i in range(1, 5)],
+                "24强附加赛对阵": [f"{slot}: {a.name} vs {b.name}" for slot, a, b, _ in state["playoff_pairs"]],
+            }
+        )
+        ms: List[Match] = []
+        for slot, a, b, _ in state["playoff_pairs"]:
+            h, aw = (a, b) if self.rng.random() < 0.5 else (b, a)
+            ms.append(
+                Match(
+                    comp=f"{comp_prefix}-PO",
+                    stage=f"24强附加赛·{slot}",
+                    day=0,
+                    round_num=int(slot[1:]),
+                    home=h,
+                    away=aw,
+                    kind="knockout",
+                    neutral=True,
+                )
+            )
+        return ms
+
+    def _challenger_build_r16_matches(self, comp_prefix: str) -> List[Match]:
+        state = self._challenger_bracket_state.get(comp_prefix) or self._challenger_refresh_bracket_state(comp_prefix)
+        draw_strength = self._challenger_draw_strength[comp_prefix]
+        r16_slots = get_r16_slots(draw_strength, self.rng)
+        p_winners = {f"P{i}": self._challenger_po_winner(comp_prefix, f"P{i}") for i in range(1, 9)}
+        slot_teams: Dict[str, Team] = dict(state["placements"])
+        pair_log: List[str] = []
+        ms: List[Match] = []
+        for ri, (slot, left_key, right_key) in enumerate(r16_slots, start=1):
+            a = slot_teams[left_key]
+            b = slot_teams[right_key] if not right_key.startswith("P") else p_winners[right_key]
+            pair_log.append(f"{slot}: {a.name} vs {b.name} ({left_key} vs {right_key})")
+            h, aw = (a, b) if self.rng.random() < 0.5 else (b, a)
+            ms.append(
+                Match(
+                    comp=f"{comp_prefix}-KO",
+                    stage=f"1/8决赛·{slot}",
+                    day=0,
+                    round_num=ri,
+                    home=h,
+                    away=aw,
+                    kind="knockout",
+                    neutral=True,
+                )
+            )
+        self.draw_log.append(
+            {
+                "type": f"{comp_prefix.lower()}_r16_fixed",
+                "赛事": comp_prefix,
+                "说明": "16强签表（抽签后算法生成，八强前同组回避）",
+                "对阵": pair_log,
+            }
+        )
+        return ms
+
+    def _challenger_build_qf_matches(self, comp_prefix: str) -> List[Match]:
+        w = self._challenger_ko_winners_by_round(comp_prefix, "1/8决赛", 8)
+        if len(w) != 8:
+            raise RuntimeError(f"{comp_prefix} 1/8 胜者数量异常")
+        ms: List[Match] = []
+        pair_log: List[str] = []
+        for qi, (ia, ib) in enumerate(QF_PAIR_IDX, start=1):
+            a, b = w[ia], w[ib]
+            pair_log.append(f"QF{qi}: {a.name} vs {b.name}")
+            h, aw = (a, b) if self.rng.random() < 0.5 else (b, a)
+            ms.append(
+                Match(
+                    comp=f"{comp_prefix}-KO",
+                    stage=f"1/4决赛·QF{qi}",
+                    day=0,
+                    round_num=qi,
+                    home=h,
+                    away=aw,
+                    kind="knockout",
+                    neutral=True,
+                )
+            )
+        self.draw_log.append(
+            {"type": f"{comp_prefix.lower()}_qf_fixed", "赛事": comp_prefix, "说明": "8强固定签表", "对阵": pair_log}
+        )
+        return ms
+
+    def _challenger_build_sf_matches(self, comp_prefix: str) -> List[Match]:
+        w = self._challenger_ko_winners_by_round(comp_prefix, "1/4决赛", 4)
+        if len(w) != 4:
+            raise RuntimeError(f"{comp_prefix} 1/4 胜者数量异常")
+        ms: List[Match] = []
+        pair_log: List[str] = []
+        for si, (ia, ib) in enumerate(SF_PAIR_IDX, start=1):
+            a, b = w[ia], w[ib]
+            pair_log.append(f"SF{si}: {a.name} vs {b.name}")
+            h, aw = (a, b) if self.rng.random() < 0.5 else (b, a)
+            ms.append(
+                Match(
+                    comp=f"{comp_prefix}-KO",
+                    stage=f"半决赛·SF{si}",
+                    day=0,
+                    round_num=si,
+                    home=h,
+                    away=aw,
+                    kind="knockout",
+                    neutral=True,
+                )
+            )
+        self.draw_log.append(
+            {"type": f"{comp_prefix.lower()}_sf_fixed", "赛事": comp_prefix, "说明": "半决赛固定签表", "对阵": pair_log}
+        )
+        return ms
+
+    def _challenger_build_final_match(self, comp_prefix: str) -> Match:
+        w = self._challenger_ko_winners_by_round(comp_prefix, "半决赛", 2)
+        if len(w) != 2:
+            raise RuntimeError(f"{comp_prefix} 半决赛胜者数量异常")
+        a, b = w[0], w[1]
+        h, aw = (a, b) if self.rng.random() < 0.5 else (b, a)
+        self.draw_log.append(
+            {
+                "type": f"{comp_prefix.lower()}_final",
+                "赛事": comp_prefix,
+                "说明": "决赛（名义主客随机）",
+                "对阵": f"{h.name} vs {aw.name}",
+            }
+        )
+        return Match(
+            comp=f"{comp_prefix}-KO",
+            stage="决赛",
+            day=0,
+            round_num=1,
+            home=h,
+            away=aw,
+            kind="knockout",
+            neutral=True,
+        )
+
+    def _wcc_extend_next_day(self, extra: List[Match]) -> None:
+        if not self.phase_matchdays:
+            return
+        self.phase_matchdays[0].extend(extra)
+
+    def _wcc_schedule_po(self) -> None:
+        self._wcc_extend_next_day(self._challenger_build_po_matches("WCC"))
+
+    def _wcc_schedule_r16(self) -> None:
+        self._wcc_extend_next_day(self._challenger_build_r16_matches("WCC"))
+
+    def _wcc_schedule_qf(self) -> None:
+        self._wcc_extend_next_day(self._challenger_build_qf_matches("WCC"))
+
+    def _wcc_schedule_sf(self) -> None:
+        self._wcc_extend_next_day(self._challenger_build_sf_matches("WCC"))
+
+    def _wcc_schedule_final(self) -> None:
+        self._wcc_extend_next_day([self._challenger_build_final_match("WCC")])
+
+    def _wcc_maybe_inject_after_p1_day(self) -> None:
+        if not self.phase_matchdays:
+            return
+        d = self._p1_days_completed
+        if d == 5 and not self._wcc_inject_flags["po"]:
+            self._wcc_schedule_po()
+            self._wcc_inject_flags["po"] = True
+        elif d == 6 and not self._wcc_inject_flags["r16"]:
+            self._wcc_schedule_r16()
+            self._wcc_inject_flags["r16"] = True
+        elif d == 7 and not self._wcc_inject_flags["qf"]:
+            self._wcc_schedule_qf()
+            self._wcc_inject_flags["qf"] = True
+        elif d == 8 and not self._wcc_inject_flags["sf"]:
+            self._wcc_schedule_sf()
+            self._wcc_inject_flags["sf"] = True
+        elif d == 9 and not self._wcc_inject_flags["fin"]:
+            self._wcc_schedule_final()
+            self._wcc_inject_flags["fin"] = True
+
+    def _wcc_note_champion_from_last_day(self) -> None:
+        for m in self._last_day_matches:
+            if m.comp != "WCC-KO" or m.stage != "决赛" or not m.played:
+                continue
+            w = m.winner
+            if w is None:
+                w = m.home if m.hg > m.ag else m.away
+            self.wcc_champion = w.name
+            self.draw_log.append({"type": "wcc_champion", "冠军": self.wcc_champion})
+            return
 
     def _po_single_winner(self, comp: str, a: Team, b: Team) -> Team:
         for m in self.all_results:
@@ -738,59 +1313,16 @@ class Simulator:
             return a if a.world_rank < b.world_rank else b
         raise RuntimeError(f"未找到单场附加赛结果: {comp} {a.name} vs {b.name}")
 
-    def _weak_goals_trailing(self, pow_diff: float, *, upset: bool) -> int:
-        """预计输球一方的进球；pow_diff 为双方战力差绝对值，upset 时更偏保守。"""
-        x = max(0.0, pow_diff)
-        if upset:
-            return int(self.rng.choices([0, 1, 2, 3], weights=[28, 38, 24, 10])[0])
-        if x < 200:
-            return int(self.rng.choices([0, 1, 2, 3, 4], weights=[18, 32, 32, 14, 4])[0])
-        if x < 450:
-            return int(self.rng.choices([0, 1, 2, 3], weights=[32, 38, 22, 8])[0])
-        if x < 700:
-            return int(self.rng.choices([0, 1, 2, 3], weights=[45, 35, 15, 5])[0])
-        return int(self.rng.choices([0, 1, 2], weights=[58, 32, 10])[0])
+    def _match_ovr_with_home(self, t: Team, home_adv: float) -> float:
+        return self._clamp_match_ovr(t.ovr + home_adv * OVR_HOME_OVR_PER_POWER)
 
-    def _win_margin(self, pow_diff: float, *, upset: bool) -> int:
-        """胜方相对负方的净胜球（至少 1）；大差距时仍可出大比分但概率低。"""
-        x = max(0.0, pow_diff)
-        if upset:
-            return int(self.rng.choices([1, 2, 3, 4], weights=[42, 38, 15, 5])[0])
-        if x < 150:
-            return int(self.rng.choices([1, 2, 3, 4], weights=[38, 40, 18, 4])[0])
-        if x < 350:
-            r = int(self.rng.choices([1, 2, 3, 4, 5], weights=[22, 35, 28, 12, 3])[0])
-            return max(1, min(5, r + int(x // 280)))
-        if x < 600:
-            r = int(self.rng.choices([2, 3, 4, 5, 6], weights=[18, 32, 28, 15, 7])[0])
-            return max(1, min(7, r))
-        r = int(self.rng.choices([2, 3, 4, 5, 6, 7], weights=[12, 28, 28, 18, 10, 4])[0])
-        if x > 750 and self.rng.random() < 0.06:
-            r += self.rng.randint(1, 3)
-        if x > 900 and self.rng.random() < 0.035:
-            r += self.rng.randint(2, 4)
-        return max(1, min(r, 9))
+    def _goals_league_90(self, hp: Team, ap: Team, adv: float) -> Tuple[int, int]:
+        ho = self._match_ovr_with_home(hp, adv)
+        return _goals_from_ovr(self.rng, ho, ap.ovr)
 
-    def _goals_non_draw_90(self, hp: Team, ap: Team, adv: float) -> Tuple[int, int]:
-        """先按主场胜率定胜负，再采样比分；爆冷时压低总进球与净胜。"""
-        ph = _p_win(hp, ap, adv)
-        favor_home = (hp.power + adv) >= ap.power
-        home_wins = self.rng.random() < ph
-        upset = home_wins != favor_home
-        d = abs((hp.power + adv) - ap.power)
-        d_eff = min(d, 200.0) if upset else d
-        lg = self._weak_goals_trailing(d_eff, upset=upset)
-        m = self._win_margin(max(d_eff, 35.0), upset=upset)
-        wg = lg + m
-        max_w = 7 if upset else 12
-        max_l = 4 if upset else 7
-        wg = min(wg, max_w)
-        lg = min(lg, max_l)
-        if wg <= lg:
-            wg = lg + 1
-        if home_wins:
-            return wg, lg
-        return lg, wg
+    def _goals_knockout_90(self, hp: Team, ap: Team, adv: float) -> Tuple[int, int]:
+        ho = self._match_ovr_with_home(hp, adv)
+        return _goals_from_ovr(self.rng, ho, ap.ovr)
 
     def _league_home_adv(self, m: Match) -> float:
         return 0.0 if m.neutral else 20.0
@@ -800,20 +1332,6 @@ class Simulator:
 
     def _et_home_adv(self, m: Match) -> float:
         return 0.0 if m.neutral else 14.0
-
-    def _goals_league_90(self, hp: Team, ap: Team, adv: float) -> Tuple[int, int]:
-        draw_p = max(0.08, min(0.30, 0.26 - abs(hp.power - ap.power) / 1050.0))
-        if self.rng.random() < draw_p:
-            g = self.rng.choice([0, 1, 1, 2])
-            return g, g
-        return self._goals_non_draw_90(hp, ap, adv)
-
-    def _goals_knockout_90(self, hp: Team, ap: Team, adv: float) -> Tuple[int, int]:
-        draw_p = max(0.05, min(0.22, 0.17 - abs(hp.power - ap.power) / 720.0))
-        if self.rng.random() < draw_p:
-            g = self.rng.choice([0, 1, 1, 2])
-            return g, g
-        return self._goals_non_draw_90(hp, ap, adv)
 
     def _goals_extra_time(self, hp: Team, ap: Team, et_adv: float) -> Tuple[int, int]:
         if self.rng.random() < 0.52:
@@ -933,10 +1451,10 @@ class Simulator:
         if comp not in self.tables:
             return []
 
-        def k(item: Tuple[str, Dict[str, int]]) -> Tuple[int, int, int, int]:
+        def k(item: Tuple[str, Dict[str, int]]) -> Tuple[int, int, int, int, int]:
             n, s = item
             wr = self.team_map[n].world_rank
-            return (s["PTS"], s["GD"], s["GF"], -wr)
+            return (s["PTS"], s["GD"], s["GF"], s["W"], -wr)
 
         return sorted(self.tables[comp].items(), key=k, reverse=True)
 
@@ -998,13 +1516,18 @@ class Simulator:
             draws.append(
                 {
                     "赛事": comp_key,
+                    "主场规则": "单场附加赛由世界排名更靠前（world_rank 数值更小）的一方主场；同分按队名序。",
                     "第一档(排名靠前)": [t.name for t in sorted(bucket, key=lambda x: x.world_rank)[: len(bucket) // 2]],
                     "第二档": [t.name for t in sorted(bucket, key=lambda x: x.world_rank)[len(bucket) // 2 :]],
                     "抽签对阵": [(a.name, b.name) for a, b in prs],
                 }
             )
             for a, b in prs:
-                home, away = (a, b) if self.rng.random() < 0.5 else (b, a)
+                # 世界排名更靠前（数值更小）的一方主场；平局按队名稳定决胜
+                if a.world_rank != b.world_rank:
+                    home, away = (a, b) if a.world_rank < b.world_rank else (b, a)
+                else:
+                    home, away = (a, b) if a.name <= b.name else (b, a)
                 md[0].append(
                     Match(
                         comp=comp_key,
@@ -1046,9 +1569,9 @@ class Simulator:
                 break
         return lst[:36]
 
-    def _build_cup_leagues(self) -> None:
+    def _build_cup_group_stages(self) -> None:
         self._merge_po_into_tournament_slots()
-        self.phase_name = "第四阶段：三大杯正赛联赛（每队8场，4档×每档2对手）"
+        self.phase_name = "第四阶段：三大杯正赛（6 组单循环 5 轮，24 强积分种子附加赛制）"
         self.draw_log.append({"type": "final_cup_qualifiers_merged", "note": "洲际附加赛胜者已并入各杯名额"})
 
         cups = [
@@ -1057,198 +1580,79 @@ class Simulator:
             ("WORLD-ASSOCIATION", self._fill_36(self.qual_slots["WA"])),
         ]
 
-        cup_plans: Dict[str, List[List[Tuple[Team, Team]]]] = {}
-        days: List[List[Match]] = []
-
+        cup_rounds: Dict[str, List[List[Match]]] = {}
         for cup_name, t36 in cups:
-            pots = split_into_pots(sorted(t36, key=lambda t: t.world_rank), 4)
-            pot_names = [[t.name for t in p] for p in pots]
-            self.draw_log.append({"type": "final_cup_pots", "杯赛": cup_name, "pots": pot_names})
-            edges = build_pot_league_edges(pots)
-            _verify_regular(edges, sorted(t36, key=lambda t: t.world_rank), 8)
-            sched = assign_rounds_auto(edges, 8, self.rng)
-            if sched is None:
-                raise RuntimeError(f"{cup_name} 决赛圈赛程分配失败")
-            oriented = assign_balanced_home_away(pots, edges)
-            rounds_fixtures: List[List[Tuple[Team, Team]]] = []
+            cup_rounds[cup_name] = self._challenger_build_group_stage(
+                cup_name,
+                t36,
+                log_type="final_cup_group_draw",
+                log_note="36 队分 6 组单循环 5 轮；前二均值定 S7/S8，前四均值最弱四组第四打 T",
+            )
             disp: List[List[Tuple[str, str, str, str]]] = []
-            for r in range(8):
-                rnd: List[Tuple[Team, Team]] = []
+            for ri, rnd in enumerate(cup_rounds[cup_name], start=1):
                 row: List[Tuple[str, str, str, str]] = []
-                for mi in sched[r]:
-                    home, away = oriented[mi]
-                    rnd.append((home, away))
-                    row.append((home.name, "vs", away.name, venue_caption(True, home.name)))
-                rounds_fixtures.append(rnd)
+                for m in rnd:
+                    row.append((m.home.name, "vs", m.away.name, venue_caption(True, m.home.name)))
                 disp.append(row)
-            cup_plans[cup_name] = rounds_fixtures
             self.league_schedule_by_confed[cup_name] = disp
-            self.draw_log.append({"type": "league_schedule_ready", "赛事": cup_name, "总轮次": 8, "每队场次": 8})
+            self.draw_log.append(
+                {"type": "league_schedule_ready", "赛事": cup_name, "总轮次": 5, "每队场次": 5, "赛制": "6组单循环"}
+            )
 
-        for r in range(8):
+        days: List[List[Match]] = []
+        for r in range(5):
             day: List[Match] = []
             for cup_name, _ in cups:
-                for home, away in cup_plans[cup_name][r]:
-                    day.append(
-                        Match(
-                            comp=cup_name,
-                            stage=f"正赛联赛第{r+1}轮",
-                            day=0,
-                            round_num=r + 1,
-                            home=home,
-                            away=away,
-                            kind="league",
-                            neutral=True,
-                        )
-                    )
+                day.extend(cup_rounds[cup_name][r])
             days.append(day)
-
         self.phase_matchdays = days
 
-    def _team_at_cup_rank(self, cup: str, rank_1based: int) -> Team:
-        tab = self._sorted_table(cup)
-        return self.team_map[tab[rank_1based - 1][0]]
-
-    def _cup_playoff_rank_pairs(self) -> List[Tuple[int, int]]:
-        return [(9, 24), (10, 23), (11, 22), (12, 21), (13, 20), (14, 19), (15, 18), (16, 17)]
-
-    def _cup_po_winner(self, cup: str, hi: int, lo: int) -> Team:
-        ta = self._team_at_cup_rank(cup, hi)
-        tb = self._team_at_cup_rank(cup, lo)
-        for m in self.all_results:
-            if m.comp != f"{cup}-PO":
-                continue
-            if {m.home.name, m.away.name} != {ta.name, tb.name}:
-                continue
-            if m.winner is not None:
-                return m.winner
-            if m.hg > m.ag:
-                return m.home
-            if m.ag > m.hg:
-                return m.away
-            return ta if ta.world_rank < tb.world_rank else tb
-        raise RuntimeError(f"未找到 {cup} 附加赛单场结果: {ta.name} vs {tb.name}")
-
-    def _winners_from_last_ko(self, cup: str, stage_sub: str) -> List[Team]:
-        ms = [m for m in self._last_day_matches if m.comp == f"{cup}-KO" and stage_sub in m.stage]
-        out: List[Team] = []
-        for m in ms:
-            w = m.winner
-            if w is None:
-                w = m.home if m.hg > m.ag else m.away
-            out.append(w)
-        return out
-
     def _begin_cup_knockout_bracket(self) -> None:
-        self.phase_name = "第五阶段：三大杯淘汰赛（9～24 名单回合附加赛 → 单场淘汰）"
-        self._ko_sub = "PO1"
-        self.draw_log.append({"type": "cup_knockout_start", "说明": "联赛 1～8 名直接晋级 16 强；9～24 名单场决胜另 8 席"})
-        self._build_cup_po_single_all()
+        self.phase_name = "第五阶段：三大杯淘汰赛（24 强附加赛 → 固定签表淘汰）"
+        self._ko_sub = "PO"
+        self.draw_log.append(
+            {
+                "type": "cup_knockout_start",
+                "说明": "6 个小组第一 + 前二均值最优两组第二名（S7/S8）直通 16 强；前四均值最弱四组第四 vs 其余四组第二",
+                "签表": {
+                    "24强附加赛": "P1–P4: T vs 最弱四组第四；P5/P6: 余下两组第三第四交叉；P7/P8: 最弱四组第三两两对阵",
+                    "1/8决赛": "抽签后按同组回避算法生成（见分组抽签记录）",
+                    "1/4决赛": "R16-1 vs R16-2, R16-3 vs R16-4, R16-5 vs R16-6, R16-7 vs R16-8",
+                    "半决赛": "QF1 vs QF2, QF3 vs QF4",
+                    "决赛": "两场半决赛胜者",
+                },
+            }
+        )
+        self._build_cup_po_all()
 
-    def _build_cup_po_single_all(self) -> None:
+    def _build_cup_po_all(self) -> None:
         day: List[Match] = []
         for cup in FINAL_CUPS:
-            for hi, lo in self._cup_playoff_rank_pairs():
-                ta = self._team_at_cup_rank(cup, hi)
-                tb = self._team_at_cup_rank(cup, lo)
-                home, away = (ta, tb) if self.rng.random() < 0.5 else (tb, ta)
-                day.append(
-                    Match(
-                        comp=f"{cup}-PO",
-                        stage="9-24附加赛",
-                        day=0,
-                        round_num=1,
-                        home=home,
-                        away=away,
-                        kind="knockout",
-                        neutral=True,
-                    )
-                )
+            day.extend(self._challenger_build_po_matches(cup))
         self.phase_matchdays = [day]
 
     def _build_cup_r16_all(self) -> None:
         day: List[Match] = []
-        pairs = self._cup_playoff_rank_pairs()
         for cup in FINAL_CUPS:
-            tops = [self._team_at_cup_rank(cup, r) for r in range(1, 9)]
-            wins = [self._cup_po_winner(cup, hi, lo) for hi, lo in pairs]
-            for i in range(8):
-                t1, t2 = tops[i], wins[i]
-                home, away = (t1, t2) if self.rng.random() < 0.5 else (t2, t1)
-                day.append(
-                    Match(
-                        comp=f"{cup}-KO",
-                        stage="1/8决赛",
-                        day=0,
-                        round_num=1,
-                        home=home,
-                        away=away,
-                        kind="knockout",
-                        neutral=True,
-                    )
-                )
+            day.extend(self._challenger_build_r16_matches(cup))
         self.phase_matchdays = [day]
 
     def _build_cup_qf_all(self) -> None:
         day: List[Match] = []
         for cup in FINAL_CUPS:
-            w = self._winners_from_last_ko(cup, "1/8")
-            for j in range(0, 8, 2):
-                a, b = w[j], w[j + 1]
-                home, away = (a, b) if self.rng.random() < 0.5 else (b, a)
-                day.append(
-                    Match(
-                        comp=f"{cup}-KO",
-                        stage="1/4决赛",
-                        day=0,
-                        round_num=1,
-                        home=home,
-                        away=away,
-                        kind="knockout",
-                        neutral=True,
-                    )
-                )
+            day.extend(self._challenger_build_qf_matches(cup))
         self.phase_matchdays = [day]
 
     def _build_cup_sf_all(self) -> None:
         day: List[Match] = []
         for cup in FINAL_CUPS:
-            w = self._winners_from_last_ko(cup, "1/4")
-            for j in range(0, 4, 2):
-                a, b = w[j], w[j + 1]
-                home, away = (a, b) if self.rng.random() < 0.5 else (b, a)
-                day.append(
-                    Match(
-                        comp=f"{cup}-KO",
-                        stage="半决赛",
-                        day=0,
-                        round_num=1,
-                        home=home,
-                        away=away,
-                        kind="knockout",
-                        neutral=True,
-                    )
-                )
+            day.extend(self._challenger_build_sf_matches(cup))
         self.phase_matchdays = [day]
 
     def _build_cup_final_all(self) -> None:
         day: List[Match] = []
         for cup in FINAL_CUPS:
-            w = self._winners_from_last_ko(cup, "半决赛")
-            a, b = w[0], w[1]
-            home, away = (a, b) if self.rng.random() < 0.5 else (b, a)
-            day.append(
-                Match(
-                    comp=f"{cup}-KO",
-                    stage="决赛",
-                    day=0,
-                    round_num=1,
-                    home=home,
-                    away=away,
-                    kind="knockout",
-                    neutral=True,
-                )
-            )
+            day.append(self._challenger_build_final_match(cup))
         self.phase_matchdays = [day]
 
     def _record_cup_champions(self) -> None:
@@ -1263,7 +1667,7 @@ class Simulator:
         self.draw_log.append({"type": "cup_champions", "冠军": dict(self.cup_champions)})
 
     def _cup_knockout_advance(self) -> bool:
-        if self._ko_sub == "PO1":
+        if self._ko_sub == "PO":
             self._ko_sub = "R16"
             self._build_cup_r16_all()
             return True
@@ -1296,6 +1700,12 @@ class Simulator:
             m.day = self.day
             self._play(m)
 
+        if self.phase_idx == 1 and len(self._wcc_prelim_losers) == 36:
+            self._p1_days_completed += 1
+            if self.phase_matchdays:
+                self._wcc_maybe_inject_after_p1_day()
+        self._wcc_note_champion_from_last_day()
+
         if not self.phase_matchdays:
             if self.phase_idx == 0:
                 self._collect_prelim_winners()
@@ -1304,7 +1714,7 @@ class Simulator:
                 self._build_intercontinental()
                 self.phase_idx = 2
             elif self.phase_idx == 2:
-                self._build_cup_leagues()
+                self._build_cup_group_stages()
                 self.phase_idx = 3
             elif self.phase_idx == 3:
                 self._begin_cup_knockout_bracket()
@@ -1314,6 +1724,36 @@ class Simulator:
                     self.phase_name = "已结束"
                     return False
         return True
+
+    def upcoming_matches_for_team(self, team_name: str) -> List[Dict[str, Any]]:
+        """
+        查询该队在「当前尚未进行的比赛日队列」中的赛程（自下一轮起按顺序）。
+        赛季全部结束后 `phase_matchdays` 为空，则返回空列表。
+        """
+        if team_name not in self.team_map:
+            return []
+        out: List[Dict[str, Any]] = []
+        for d_off, day in enumerate(self.phase_matchdays, start=1):
+            for m in day:
+                if m.home.name != team_name and m.away.name != team_name:
+                    continue
+                opp = m.away.name if m.home.name == team_name else m.home.name
+                if m.neutral:
+                    venue = "中立"
+                else:
+                    venue = "主场" if m.home.name == team_name else "客场"
+                out.append(
+                    {
+                        "再过比赛日": d_off,
+                        "赛事": m.comp,
+                        "阶段": m.stage,
+                        "轮次": m.round_num,
+                        "对手": opp,
+                        "主客": venue,
+                        "对阵": f"{m.home.name} vs {m.away.name}",
+                    }
+                )
+        return out
 
     def list_competitions(self) -> List[str]:
         comps = set(self.tables.keys())
