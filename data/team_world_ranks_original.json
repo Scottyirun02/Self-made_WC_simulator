@@ -1,5 +1,5 @@
 {
-  "_comment": "世界排名原始库（数字越小越强）。开局从本文件/original 回溯；Part A 后写入 team_world_ranks_cycle.json 供 Part B 使用。",
+  "_comment": "世界排名原始库备份。开局 reset_cycle_ranks_from_original() 用此文件覆盖 cycle。",
   "England": 1,
   "France": 2,
   "Germany": 3,
