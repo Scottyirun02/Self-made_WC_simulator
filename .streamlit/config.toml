@@ -1,0 +1,10 @@
+[server]
+# 降低手机端 Websocket 解码失败概率（大 HTML / 表格）
+maxMessageSize = 500
+enableWebsocketCompression = true
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+fastReruns = true

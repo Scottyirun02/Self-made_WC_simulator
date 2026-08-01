@@ -1790,20 +1790,52 @@ def _available_draw_views(sim: Simulator) -> List[Dict[str, Any]]:
 
 
 def _render_draw_view(sim: Simulator, view: Dict[str, Any]) -> None:
+    """分页渲染，避免手机端一次推送过大 HTML 导致 Websocket RangeError。"""
     kind = view["kind"]
     if kind == "groups":
         groups = view["groups"]
-        nrows = (len(groups) + 3) // 4
-        h = min(920, max(220, 48 + nrows * 200))
-        _render_bracket_html(_group_draw_html(groups), height=h)
+        page_size = 8
+        if len(groups) > page_size:
+            n_pages = (len(groups) + page_size - 1) // page_size
+            page_i = st.number_input(
+                "分组页",
+                min_value=1,
+                max_value=n_pages,
+                value=1,
+                step=1,
+                key=f"draw_groups_page_{view['id']}",
+            )
+            start = (int(page_i) - 1) * page_size
+            chunk = groups[start : start + page_size]
+            st.caption(f"第 {page_i}/{n_pages} 页 · 共 {len(groups)} 组")
+        else:
+            chunk = groups
+        nrows = (len(chunk) + 3) // 4
+        h = min(720, max(200, 40 + nrows * 190))
+        _render_bracket_html(_group_draw_html(chunk), height=h)
     elif kind == "swiss":
         teams = view["teams"]
-        nrows = (len(teams) + 3) // 4
-        h = min(980, max(280, 40 + nrows * 250))
-        _render_bracket_html(_swiss_draw_html(sim, view["comp"], teams), height=h)
+        page_size = 8
+        n_pages = max(1, (len(teams) + page_size - 1) // page_size)
+        page_i = 1
+        if n_pages > 1:
+            page_i = st.number_input(
+                "球队页",
+                min_value=1,
+                max_value=n_pages,
+                value=1,
+                step=1,
+                key=f"draw_swiss_page_{view['id']}",
+            )
+            st.caption(f"第 {int(page_i)}/{n_pages} 页 · 共 {len(teams)} 队（分页减轻手机端卡顿）")
+        start = (int(page_i) - 1) * page_size
+        chunk = teams[start : start + page_size]
+        nrows = (len(chunk) + 3) // 4
+        h = min(780, max(240, 36 + nrows * 235))
+        _render_bracket_html(_swiss_draw_html(sim, view["comp"], chunk), height=h)
     elif kind == "standings":
         n = len(sim.tables.get(view["comp"], {})) or 12
-        h = min(720, max(280, 90 + n * 34))
+        h = min(640, max(260, 80 + n * 32))
         _render_bracket_html(
             _standings_draw_html(sim, view["comp"], view.get("title", view["label"])),
             height=h,
@@ -2080,9 +2112,21 @@ def main() -> None:
         else:
             pick_s = st.selectbox("选择赛事", comps_sched, key="sched_pick")
             rounds_data = sim.league_schedule_by_confed.get(pick_s, [])
-            for ridx, rnd in enumerate(rounds_data, start=1):
+            if not rounds_data:
+                st.caption("该赛事暂无赛程。")
+            else:
+                # 只渲染一轮，避免手机端一次推送全部轮次文本过大
+                ridx = st.number_input(
+                    "查看轮次",
+                    min_value=1,
+                    max_value=len(rounds_data),
+                    value=1,
+                    step=1,
+                    key="sched_round_pick",
+                )
+                rnd = rounds_data[int(ridx) - 1]
                 lines = [f"{a} {vs} {b}  （{lbl}）" for a, vs, b, lbl in rnd]
-                st.markdown(f"**第 {ridx} 轮**（{len(lines)} 场）")
+                st.markdown(f"**第 {int(ridx)} / {len(rounds_data)} 轮**（{len(lines)} 场）")
                 st.text("\n".join(lines))
 
         st.subheader("查询球队未来赛程")
@@ -2092,7 +2136,18 @@ def main() -> None:
         if not fut:
             st.info("暂无未赛场次（可能本赛季已结束，或该队已无剩余比赛）。")
         else:
-            st.dataframe(pd.DataFrame(fut), use_container_width=True, hide_index=True)
+            # 手机端限制行数，完整数据可下载
+            show_n = min(40, len(fut))
+            st.caption(f"显示最近 {show_n} / 共 {len(fut)} 场未赛")
+            st.dataframe(pd.DataFrame(fut[:show_n]), use_container_width=True, hide_index=True)
+            if len(fut) > show_n:
+                st.download_button(
+                    "下载该队全部未来赛程 CSV",
+                    data=pd.DataFrame(fut).to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"upcoming_{q_team}.csv",
+                    mime="text/csv",
+                    key="dl_future_sched",
+                )
 
     elif page == "总览":
         c1, c2, c3, c4 = st.columns(4)
