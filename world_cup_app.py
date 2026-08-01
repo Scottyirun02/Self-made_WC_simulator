@@ -1460,6 +1460,356 @@ def _render_bracket_html(page: str, height: int = 820) -> None:
     components.html(page, height=height, scrolling=True)
 
 
+DRAW_CARDS_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: transparent;
+  color: #e6e9ef;
+  padding: 4px 2px 8px;
+}
+.grid, .swiss-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.gcard {
+  background: #1c2333;
+  border: 1px solid #2a3346;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.ghead {
+  background: #243049;
+  color: #d7deea;
+  text-align: center;
+  font-weight: 700;
+  font-size: 14px;
+  padding: 8px 6px;
+  letter-spacing: .06em;
+  border-bottom: 1px solid #2f3a52;
+}
+.gbody { padding: 4px 0; }
+.gbody .team {
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #e8ecf4;
+  border-bottom: 1px solid #262f42;
+}
+.gbody .team:last-child { border-bottom: none; }
+.gbody .team:nth-child(even) { background: rgba(255,255,255,.03); }
+.scard {
+  background: #1a2740;
+  color: #e8ecf4;
+  border: 1px solid #2c3d5c;
+  border-radius: 10px;
+  padding: 12px 12px 10px;
+  min-height: 200px;
+}
+.scard .top {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #334866;
+}
+.scard .team-name {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: #f2f5fa;
+}
+.scard .vs {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: #8fa4c4;
+}
+.scard .opp {
+  font-size: 12px;
+  padding: 3px 0;
+  font-weight: 500;
+  color: #d5dce8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.scard .split {
+  height: 1px;
+  background: #334866;
+  margin: 6px 0;
+}
+.scard .side-lab {
+  font-size: 10px;
+  color: #8fa4c4;
+  margin-bottom: 2px;
+  letter-spacing: .06em;
+}
+.stand-wrap { max-width: 720px; margin: 0 auto; }
+.stand-card {
+  background: #1c2333;
+  border: 1px solid #2a3346;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.stand-card .ghead { font-size: 15px; padding: 10px; }
+.stand-card table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  color: #e6e9ef;
+}
+.stand-card th {
+  background: #243049;
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 700;
+  color: #c5cede;
+  border-bottom: 1px solid #2f3a52;
+}
+.stand-card td {
+  padding: 7px 10px;
+  border-bottom: 1px solid #262f42;
+}
+.stand-card tr:nth-child(even) td { background: rgba(255,255,255,.025); }
+.stand-card tr:last-child td { border-bottom: none; }
+.stand-card .rk { width: 36px; color: #8b95a8; font-weight: 700; }
+.stand-card .num { text-align: right; font-variant-numeric: tabular-nums; color: #cfd6e4; }
+.empty { color: #8b95a8; padding: 24px; text-align: center; }
+@media (max-width: 900px) {
+  .grid, .swiss-grid { grid-template-columns: repeat(2, 1fr); }
+}
+"""
+
+
+def _group_names_from_teams(groups: List[List[Any]], labels: List[str]) -> List[Tuple[str, List[str]]]:
+    out: List[Tuple[str, List[str]]] = []
+    for i, g in enumerate(groups):
+        lab = labels[i] if i < len(labels) else chr(ord("A") + i)
+        names = [t.name if hasattr(t, "name") else str(t) for t in g]
+        out.append((lab, names))
+    return out
+
+
+def _group_draw_html(groups: List[Tuple[str, List[str]]]) -> str:
+    cards: List[str] = []
+    for lab, teams in groups:
+        rows = "".join(f'<div class="team">{html.escape(n)}</div>' for n in teams)
+        title = lab if lab.endswith("组") else f"{lab}组"
+        cards.append(
+            f'<div class="gcard"><div class="ghead">{html.escape(title)}</div>'
+            f'<div class="gbody">{rows}</div></div>'
+        )
+    body = f'<div class="grid">{"".join(cards)}</div>' if cards else '<div class="empty">暂无分组</div>'
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+        f"<style>{DRAW_CARDS_CSS}</style></head><body>{body}</body></html>"
+    )
+
+
+def _swiss_home_away_lists(
+    sim: Simulator, comp: str, team: str
+) -> Tuple[List[str], List[str]]:
+    """从赛程表拆主/客对手；若无赛程则按档位对手上下对半分。"""
+    home: List[str] = []
+    away: List[str] = []
+    for rnd in sim.league_schedule_by_confed.get(comp, []):
+        for a, _vs, b, _lbl in rnd:
+            if a == team:
+                home.append(b)
+            elif b == team:
+                away.append(a)
+    if home or away:
+        return home, away
+    by_pot = (sim.league_opponents_by_comp.get(comp) or {}).get(team) or {}
+    flat: List[str] = []
+    for _pot, names in sorted(by_pot.items(), key=lambda x: x[0]):
+        flat.extend(names)
+    mid = (len(flat) + 1) // 2
+    return flat[:mid], flat[mid:]
+
+
+def _swiss_draw_html(
+    sim: Simulator, comp: str, team_order: List[str]
+) -> str:
+    cards: List[str] = []
+    for team in team_order:
+        home, away = _swiss_home_away_lists(sim, comp, team)
+        home_rows = "".join(f'<div class="opp">{html.escape(n)}</div>' for n in home)
+        away_rows = "".join(f'<div class="opp">{html.escape(n)}</div>' for n in away)
+        cards.append(
+            f'<div class="scard">'
+            f'<div class="top"><span class="team-name">{html.escape(team)}</span>'
+            f'<span class="vs">VS</span></div>'
+            f'<div class="side-lab">主场</div>{home_rows}'
+            f'<div class="split"></div>'
+            f'<div class="side-lab">客场</div>{away_rows}'
+            f"</div>"
+        )
+    body = (
+        f'<div class="swiss-grid">{"".join(cards)}</div>'
+        if cards
+        else '<div class="empty">暂无瑞士轮对手</div>'
+    )
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+        f"<style>{DRAW_CARDS_CSS}</style></head><body>{body}</body></html>"
+    )
+
+
+def _standings_draw_html(sim: Simulator, comp: str, title: str) -> str:
+    tab = sim._sorted_table(comp)
+    if not tab:
+        # 抽签后可能尚无积分行：用赛程/队名兜底
+        names: List[str] = []
+        sched = sim.league_schedule_by_confed.get(comp, [])
+        seen = set()
+        for rnd in sched:
+            for a, _vs, b, _lbl in rnd:
+                for n in (a, b):
+                    if n not in seen:
+                        seen.add(n)
+                        names.append(n)
+        tab = [(n, {"P": 0, "W": 0, "D": 0, "L": 0, "GF": 0, "GA": 0, "GD": 0, "PTS": 0}) for n in names]
+    thead = (
+        "<tr><th class='rk'>#</th><th>球队</th>"
+        "<th class='num'>赛</th><th class='num'>胜</th><th class='num'>平</th>"
+        "<th class='num'>负</th><th class='num'>进</th><th class='num'>失</th>"
+        "<th class='num'>净</th><th class='num'>分</th></tr>"
+    )
+    rows_html: List[str] = []
+    for i, (name, s) in enumerate(tab, 1):
+        rows_html.append(
+            "<tr>"
+            f"<td class='rk'>{i}</td>"
+            f"<td>{html.escape(name)}</td>"
+            f"<td class='num'>{int(s.get('P', 0))}</td>"
+            f"<td class='num'>{int(s.get('W', 0))}</td>"
+            f"<td class='num'>{int(s.get('D', 0))}</td>"
+            f"<td class='num'>{int(s.get('L', 0))}</td>"
+            f"<td class='num'>{int(s.get('GF', 0))}</td>"
+            f"<td class='num'>{int(s.get('GA', 0))}</td>"
+            f"<td class='num'>{int(s.get('GD', 0))}</td>"
+            f"<td class='num'><b>{int(s.get('PTS', 0))}</b></td>"
+            "</tr>"
+        )
+    body = (
+        f"<div class='stand-wrap'><div class='stand-card'>"
+        f"<div class='ghead'>{html.escape(title)}</div>"
+        f"<table><thead>{thead}</thead><tbody>{''.join(rows_html)}</tbody></table>"
+        f"</div></div>"
+    )
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+        f"<style>{DRAW_CARDS_CSS}</style></head><body>{body}</body></html>"
+    )
+
+
+def _available_draw_views(sim: Simulator) -> List[Dict[str, Any]]:
+    """可展示的抽签视图：小组卡 / 瑞士轮卡 / 南美积分榜卡。"""
+    views: List[Dict[str, Any]] = []
+
+    for code in CONTINENTAL_CODES:
+        groups = getattr(sim, "_cont_qual_groups", {}).get(code) or []
+        if groups:
+            labels = [chr(ord("A") + i) for i in range(len(groups))]
+            views.append(
+                {
+                    "id": f"cont_qual_{code}",
+                    "label": f"{CONTINENTAL_LABELS[code]} · 预选分组",
+                    "kind": "groups",
+                    "groups": _group_names_from_teams(groups, labels),
+                }
+            )
+
+    for code in CONTINENTAL_CODES:
+        groups = getattr(sim, "_cont_finals_groups", {}).get(code) or []
+        if groups:
+            views.append(
+                {
+                    "id": f"cont_final_{code}",
+                    "label": f"{CONTINENTAL_LABELS[code]} · 正赛分组",
+                    "kind": "groups",
+                    "groups": _group_names_from_teams(groups, list(FINAL_GROUP_LABELS)),
+                }
+            )
+
+    swiss_label = {
+        "UEFA-QUAL": "欧洲预选 · 瑞士轮",
+        "AFC-QUAL": "亚洲预选 · 瑞士轮",
+        "CAF-QUAL": "非洲预选 · 瑞士轮",
+        "CONCACAF-QUAL": "中北美预选 · 瑞士轮",
+        "OFC-QUAL": "大洋洲预选 · 瑞士轮",
+    }
+    for comp in sorted(sim.league_opponents_by_comp.keys()):
+        def _rank_key(n: str, _comp: str = comp) -> int:
+            if n in sim.live_ranks:
+                return int(sim.live_ranks[n])
+            t = sim.team_map.get(n)
+            return int(t.world_rank) if t else 999
+
+        teams = sorted(sim.league_opponents_by_comp[comp].keys(), key=_rank_key)
+        views.append(
+            {
+                "id": f"swiss_{comp}",
+                "label": swiss_label.get(comp, f"{comp} · 瑞士轮"),
+                "kind": "swiss",
+                "comp": comp,
+                "teams": teams,
+            }
+        )
+
+    if sim.tables.get("CONMEBOL-QUAL") or "CONMEBOL-QUAL" in sim.league_schedule_by_confed:
+        views.append(
+            {
+                "id": "standings_CONMEBOL-QUAL",
+                "label": "南美预选 · 双循环积分榜",
+                "kind": "standings",
+                "comp": "CONMEBOL-QUAL",
+                "title": "南美预选（主客双循环）",
+            }
+        )
+
+    for prefix, lab in GROUP_STAGE_CUPS:
+        if prefix in CONTINENTAL_CODES:
+            continue
+        groups = _cup_draw_groups(sim, prefix)
+        if not groups:
+            continue
+        views.append(
+            {
+                "id": f"cup_gs_{prefix}",
+                "label": f"{lab} · 正赛分组",
+                "kind": "groups",
+                "groups": _group_names_from_teams(groups, _cup_group_labels(prefix)),
+            }
+        )
+    return views
+
+
+def _render_draw_view(sim: Simulator, view: Dict[str, Any]) -> None:
+    kind = view["kind"]
+    if kind == "groups":
+        groups = view["groups"]
+        nrows = (len(groups) + 3) // 4
+        h = min(920, max(220, 48 + nrows * 200))
+        _render_bracket_html(_group_draw_html(groups), height=h)
+    elif kind == "swiss":
+        teams = view["teams"]
+        nrows = (len(teams) + 3) // 4
+        h = min(980, max(280, 40 + nrows * 250))
+        _render_bracket_html(_swiss_draw_html(sim, view["comp"], teams), height=h)
+    elif kind == "standings":
+        n = len(sim.tables.get(view["comp"], {})) or 12
+        h = min(720, max(280, 90 + n * 34))
+        _render_bracket_html(
+            _standings_draw_html(sim, view["comp"], view.get("title", view["label"])),
+            height=h,
+        )
+
+
 def _world_rank_board_df(sim: Simulator) -> pd.DataFrame:
     """完整 1…N 世界排名表（全体球队，无断号）。"""
     board = sorted(sim.teams, key=lambda t: sim.live_ranks.get(t.name, t.world_rank))
@@ -1477,6 +1827,85 @@ def _world_rank_board_df(sim: Simulator) -> pd.DataFrame:
     )
 
 
+MAIN_PAGES = [
+    "抽签与赛程",
+    "总览",
+    "全部赛果",
+    "积分榜",
+    "世界排名",
+    "三大杯资格",
+    "淘汰赛对阵",
+]
+
+
+def _hosts_from_session() -> Dict[str, str]:
+    """on_click 时从东道主控件读最新值（早于脚本里写回 hosts）。"""
+    base = st.session_state.get("hosts") or _default_hosts()
+    hosts: Dict[str, str] = {}
+    for code in CONTINENTAL_CODES:
+        key = f"host_{code}"
+        hosts[code] = st.session_state[key] if key in st.session_state else base[code]
+    return hosts
+
+
+def _reset_sim_session() -> None:
+    st.session_state.pop("sim", None)
+    st.session_state.pop("sim_seed", None)
+    st.session_state.pop("sim_hosts", None)
+    st.session_state.pop("rank_change_report", None)
+    seed = int(st.session_state.get("seed", 42))
+    hosts = _hosts_from_session()
+    st.session_state.hosts = hosts
+    _ensure_sim(seed, hosts)
+
+
+def _advance_n_days() -> None:
+    """on_click：避免 st.rerun() 把主页面 radio 重置回第一项。"""
+    if "sim" not in st.session_state:
+        return
+    sim = st.session_state.sim
+    n_skip = int(st.session_state.get("n_skip", 1))
+    snap = sim.ranking_snapshot()
+    advanced = 0
+    for _ in range(n_skip):
+        if not sim.next_day():
+            break
+        advanced += 1
+    st.session_state.rank_change_report = {
+        "days": advanced,
+        "day": sim.day,
+        "rows": sim.ranking_delta_from(
+            snap,
+            only_played={
+                m.home.name
+                for m in sim.all_results
+                if m.day > sim.day - advanced
+            }
+            | {
+                m.away.name
+                for m in sim.all_results
+                if m.day > sim.day - advanced
+            },
+        ),
+    }
+
+
+def _advance_to_season_end() -> None:
+    """on_click：推进到结束且保持当前导航页。"""
+    if "sim" not in st.session_state:
+        return
+    sim = st.session_state.sim
+    snap = sim.ranking_snapshot()
+    start_day = sim.day
+    while sim.next_day():
+        pass
+    st.session_state.rank_change_report = {
+        "days": max(0, sim.day - start_day),
+        "day": sim.day,
+        "rows": sim.ranking_delta_from(snap),
+    }
+
+
 def main() -> None:
     st.title("⚽ 四年周期模拟器：洲际杯 → 世界杯三大杯")
     st.caption(
@@ -1487,10 +1916,21 @@ def main() -> None:
 
     if "hosts" not in st.session_state:
         st.session_state.hosts = _default_hosts()
+    if "main_page" not in st.session_state:
+        st.session_state.main_page = MAIN_PAGES[0]
+    elif st.session_state.main_page not in MAIN_PAGES:
+        st.session_state.main_page = MAIN_PAGES[0]
 
     with st.sidebar:
         st.header("控制")
-        seed = st.number_input("随机种子", min_value=0, max_value=2**31 - 1, value=42, step=1)
+        seed = st.number_input(
+            "随机种子",
+            min_value=0,
+            max_value=2**31 - 1,
+            value=42,
+            step=1,
+            key="seed",
+        )
 
         st.subheader("洲际杯东道主")
         host_vals: Dict[str, str] = {}
@@ -1509,63 +1949,26 @@ def main() -> None:
 
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("新开局", use_container_width=True):
-                st.session_state.pop("sim", None)
-                st.session_state.pop("sim_seed", None)
-                st.session_state.pop("sim_hosts", None)
-                st.session_state.pop("rank_change_report", None)
-                _ensure_sim(int(seed), host_vals)
-                st.rerun()
+            st.button("新开局", use_container_width=True, on_click=_reset_sim_session)
         with col_b:
-            if st.button("重置种子并开局", use_container_width=True):
-                st.session_state.pop("sim", None)
-                st.session_state.pop("sim_seed", None)
-                st.session_state.pop("sim_hosts", None)
-                st.session_state.pop("rank_change_report", None)
-                _ensure_sim(int(seed), host_vals)
-                st.rerun()
+            st.button("重置种子并开局", use_container_width=True, on_click=_reset_sim_session)
 
         sim = _ensure_sim(int(seed), host_vals)
 
         st.divider()
-        n_skip = st.slider("一次推进天数", 1, 30, 1)
-        if st.button(f"推进 {n_skip} 个比赛日", type="primary", use_container_width=True):
-            snap = sim.ranking_snapshot()
-            advanced = 0
-            for _ in range(n_skip):
-                if not sim.next_day():
-                    break
-                advanced += 1
-            st.session_state.rank_change_report = {
-                "days": advanced,
-                "day": sim.day,
-                "rows": sim.ranking_delta_from(
-                    snap,
-                    only_played={
-                        m.home.name
-                        for m in sim.all_results
-                        if m.day > sim.day - advanced
-                    }
-                    | {
-                        m.away.name
-                        for m in sim.all_results
-                        if m.day > sim.day - advanced
-                    },
-                ),
-            }
-            st.rerun()
-
-        if st.button("推进到赛季结束", use_container_width=True):
-            snap = sim.ranking_snapshot()
-            start_day = sim.day
-            while sim.next_day():
-                pass
-            st.session_state.rank_change_report = {
-                "days": max(0, sim.day - start_day),
-                "day": sim.day,
-                "rows": sim.ranking_delta_from(snap),
-            }
-            st.rerun()
+        n_skip = st.slider("一次推进天数", 1, 30, 1, key="n_skip")
+        # 勿在按钮分支里 st.rerun()：会重置下方主页面 radio 到第一项
+        st.button(
+            f"推进 {n_skip} 个比赛日",
+            type="primary",
+            use_container_width=True,
+            on_click=_advance_n_days,
+        )
+        st.button(
+            "推进到赛季结束",
+            use_container_width=True,
+            on_click=_advance_to_season_end,
+        )
 
         st.divider()
         st.subheader("状态")
@@ -1641,27 +2044,34 @@ def main() -> None:
                     c3.metric("原排名", one["原排名"])
                     c4.metric("原积分", one["原积分"])
 
-    MAIN_PAGES = [
-        "抽签与赛程",
-        "总览",
-        "全部赛果",
-        "积分榜",
-        "世界排名",
-        "三大杯资格",
-        "淘汰赛对阵",
-    ]
-    # radio 会写入 session_state，推进比赛日 rerun 后仍停在当前页（st.tabs 会丢）
+    # key=main_page 持久化；推进按钮用 on_click、勿 st.rerun()，否则会跳回第一项
     page = st.radio("页面", MAIN_PAGES, horizontal=True, key="main_page", label_visibility="collapsed")
 
     if page == "抽签与赛程":
         st.subheader("抽签记录")
-        if not sim.draw_log:
-            st.info("开局后可见：附加赛抽签 → 联赛分档 → 完整轮次赛程表。")
+        draw_views = _available_draw_views(sim)
+        if not draw_views:
+            st.info("开局并完成抽签后，此处显示分组 / 瑞士轮 / 南美积分榜卡片。")
         else:
-            for i, entry in enumerate(sim.draw_log):
-                et = entry.get("type", "?")
-                with st.expander(f"{i+1}. [{et}]", expanded=(i < 3)):
-                    st.json(entry)
+            by_id = {v["id"]: v for v in draw_views}
+            ids = list(by_id.keys())
+            if st.session_state.get("draw_view_pick") not in by_id:
+                st.session_state.draw_view_pick = ids[0]
+            pick_id = st.selectbox(
+                "选择抽签",
+                ids,
+                format_func=lambda i: by_id[i]["label"],
+                key="draw_view_pick",
+            )
+            view = by_id[pick_id]
+            kind_hint = {
+                "groups": "小组抽签（队名卡片）",
+                "swiss": "瑞士轮（各队对手卡片）",
+                "standings": "双循环积分榜卡片",
+            }.get(view["kind"], "")
+            if kind_hint:
+                st.caption(kind_hint)
+            _render_draw_view(sim, view)
 
         st.subheader("联赛 / 正赛赛程表（赛前即定，与模拟赛果一致）")
         comps_sched = sorted(sim.league_schedule_by_confed.keys())
@@ -1674,33 +2084,6 @@ def main() -> None:
                 lines = [f"{a} {vs} {b}  （{lbl}）" for a, vs, b, lbl in rnd]
                 st.markdown(f"**第 {ridx} 轮**（{len(lines)} 场）")
                 st.text("\n".join(lines))
-
-        st.subheader("联赛阶段：各队对手（按档）")
-        if not sim.league_opponents_by_comp:
-            st.caption("生成洲内联赛或三大杯正赛联赛后，此处显示模拟抽签得到的各队对手。")
-        else:
-            c_opp, t_opp = st.columns([1, 1])
-            with c_opp:
-                opp_comp = st.selectbox(
-                    "选择赛事",
-                    sorted(sim.league_opponents_by_comp.keys()),
-                    key="opp_by_pot_comp",
-                )
-            teams_for_comp = sorted(sim.league_opponents_by_comp.get(opp_comp, {}).keys())
-            with t_opp:
-                opp_team = st.selectbox("选择球队", teams_for_comp, key="opp_by_pot_team")
-            if opp_team and opp_comp:
-                rows = []
-                for pot_label, names in sorted(
-                    sim.league_opponents_by_comp[opp_comp][opp_team].items(),
-                    key=lambda x: x[0],
-                ):
-                    for n in names:
-                        rows.append({"对手所在档": pot_label, "对手": n})
-                if rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("无数据。")
 
         st.subheader("查询球队未来赛程")
         all_names = sorted(t.name for t in sim.teams)

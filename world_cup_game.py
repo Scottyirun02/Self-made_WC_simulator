@@ -247,53 +247,141 @@ def venue_caption(neutral: bool, home_name: str) -> str:
     return f"主场 {home_name}"
 
 
+def _home_counts(oriented: List[Tuple[Team, Team]]) -> Dict[str, int]:
+    cnt: Dict[str, int] = defaultdict(int)
+    for h, a in oriented:
+        cnt[h.name] += 1
+        cnt.setdefault(a.name, 0)
+    return cnt
+
+
+def _repair_equal_home_away(
+    oriented: List[Tuple[Team, Team]], target_home: Dict[str, int]
+) -> List[Tuple[Team, Team]]:
+    """通过翻转边，把各队主场数修到 target_home。"""
+    out = list(oriented)
+    for _ in range(len(out) * 4 + 8):
+        cnt = _home_counts(out)
+        excess = [n for n, t in target_home.items() if cnt.get(n, 0) > t]
+        deficit = [n for n, t in target_home.items() if cnt.get(n, 0) < t]
+        if not excess and not deficit:
+            return out
+        flipped = False
+        for i, (h, a) in enumerate(out):
+            if h.name in excess and a.name in deficit:
+                out[i] = (a, h)
+                flipped = True
+                break
+        if flipped:
+            continue
+        # 次优：翻转能减小总偏差的边
+        best_i = -1
+        best_delta = 0
+        base_dev = sum(abs(cnt.get(n, 0) - t) for n, t in target_home.items())
+        for i, (h, a) in enumerate(out):
+            cnt[h.name] -= 1
+            cnt[a.name] = cnt.get(a.name, 0) + 1
+            dev = sum(abs(cnt.get(n, 0) - t) for n, t in target_home.items())
+            cnt[a.name] -= 1
+            cnt[h.name] += 1
+            delta = base_dev - dev
+            if delta > best_delta:
+                best_delta = delta
+                best_i = i
+        if best_i < 0:
+            break
+        h, a = out[best_i]
+        out[best_i] = (a, h)
+    return out
+
+
 def assign_balanced_home_away(
     pots: List[List[Team]], edges: List[Tuple[Team, Team]]
 ) -> List[Tuple[Team, Team]]:
     """
-    对 pot 联赛每条边定向为主客场，使每队面对「同一对手档」的两支队时恰好 1 主 1 客
-    （含同档两对手）。与轮次分配顺序无关，按边字典序处理。
+    对瑞士轮对阵定向主客场：保证每队主场数 = 客场数 = 场次/2。
+    在偶数正则对阵图上沿欧拉回路同向定向；失败时再翻转修复。
+    pots 保留以兼容调用方（分档信息）；均衡以总主客场为准。
     """
-    pot_of: Dict[str, int] = {}
-    for pi, pot in enumerate(pots):
-        for t in pot:
-            pot_of[t.name] = pi
-    st: Dict[Tuple[str, int], Dict[str, int]] = defaultdict(lambda: {"h": 0, "a": 0})
-    tmp: Dict[int, Tuple[Team, Team]] = {}
-    order = sorted(range(len(edges)), key=lambda mi: (edges[mi][0].name, edges[mi][1].name))
-    for mi in order:
-        a, b = edges[mi]
-        pa, pb = pot_of[a.name], pot_of[b.name]
-        if pa == pb:
-            ka, kb = (a.name, pa), (b.name, pa)
+    del pots  # 总主客均衡不依赖分档
+    if not edges:
+        return []
+
+    team_of: Dict[str, Team] = {}
+    undirected: List[Tuple[str, str]] = []
+    for a, b in edges:
+        team_of[a.name] = a
+        team_of[b.name] = b
+        undirected.append((a.name, b.name))
+
+    adj: Dict[str, List[int]] = defaultdict(list)
+    for i, (u, v) in enumerate(undirected):
+        adj[u].append(i)
+        adj[v].append(i)
+
+    deg: Dict[str, int] = {n: len(idxs) for n, idxs in adj.items()}
+    for name, d in deg.items():
+        if d % 2 != 0:
+            raise ValueError(f"球队 {name} 场次 {d} 为奇数，无法均分主客场")
+
+    target_home = {n: d // 2 for n, d in deg.items()}
+    unused = [True] * len(undirected)
+    stacks: Dict[str, List[int]] = {n: list(idxs) for n, idxs in adj.items()}
+
+    def peer(ei: int, u: str) -> str:
+        x, y = undirected[ei]
+        return y if x == u else x
+
+    home_name: Dict[int, str] = {}
+
+    for start in list(adj.keys()):
+        if not any(unused[ei] for ei in adj[start]):
+            continue
+        vstack = [start]
+        estack: List[int] = []
+        tour_edges: List[int] = []
+        while vstack:
+            u = vstack[-1]
+            while stacks[u] and not unused[stacks[u][-1]]:
+                stacks[u].pop()
+            if stacks[u]:
+                ei = stacks[u].pop()
+                if not unused[ei]:
+                    continue
+                unused[ei] = False
+                vstack.append(peer(ei, u))
+                estack.append(ei)
+            else:
+                vstack.pop()
+                if estack:
+                    tour_edges.append(estack.pop())
+        tour_edges.reverse()
+        if not tour_edges:
+            continue
+        cur = start
+        e0 = tour_edges[0]
+        if cur != undirected[e0][0] and cur != undirected[e0][1]:
+            cur = undirected[e0][0]
+        for ei in tour_edges:
+            nxt = peer(ei, cur)
+            home_name[ei] = cur
+            cur = nxt
+
+    oriented: List[Tuple[Team, Team]] = []
+    for i, (a, b) in enumerate(edges):
+        h = home_name.get(i, a.name)
+        if h == a.name:
+            oriented.append((a, b))
         else:
-            ka, kb = (a.name, pb), (b.name, pa)
-        na_h = st[ka]["a"] >= 1 and st[ka]["h"] < 1
-        na_a = st[ka]["h"] >= 1 and st[ka]["a"] < 1
-        nb_h = st[kb]["a"] >= 1 and st[kb]["h"] < 1
-        nb_a = st[kb]["h"] >= 1 and st[kb]["a"] < 1
-        if na_h and nb_h:
-            a_home = a.name < b.name
-        elif na_h:
-            a_home = True
-        elif na_a:
-            a_home = False
-        elif nb_h:
-            a_home = False
-        elif nb_a:
-            a_home = True
-        else:
-            h = hashlib.md5(f"{a.name}|{b.name}".encode()).hexdigest()
-            a_home = (int(h[:8], 16) % 2 == 0)
-        if a_home:
-            tmp[mi] = (a, b)
-            st[ka]["h"] += 1
-            st[kb]["a"] += 1
-        else:
-            tmp[mi] = (b, a)
-            st[ka]["a"] += 1
-            st[kb]["h"] += 1
-    return [tmp[i] for i in range(len(edges))]
+            oriented.append((b, a))
+
+    oriented = _repair_equal_home_away(oriented, target_home)
+    cnt = _home_counts(oriented)
+    bad = [n for n, t in target_home.items() if cnt.get(n, 0) != t]
+    if bad:
+        detail = ", ".join(f"{n}:{cnt.get(n, 0)}/{target_home[n]}" for n in bad[:8])
+        raise RuntimeError(f"主客场未能均分: {detail}")
+    return oriented
 
 
 def split_into_pots(teams: List[Team], n_pots: int) -> List[List[Team]]:
@@ -1390,21 +1478,19 @@ class Simulator:
         return False
 
     def _update_cycle_ranks_after_continental(self) -> None:
-        """Part A 结束后：将实时国际积分固化为周期排名库，并刷新 OVR 供 Part B。"""
+        """Part A 结束后：固化排名库并刷新 OVR；国际积分原样带入 Part B，不按名次重算。"""
         new_ranks = dict(self.live_ranks)
         save_world_ranks(
             new_ranks,
             comment="Part A 洲际杯期间逐轮更新的国际积分所对应排名；开局从 team_world_ranks_original.json 回溯。",
         )
         self._apply_rank_map(new_ranks)
-        # 与固化排名对齐积分，避免 Part B 初值漂移
-        self.fifa_points = init_ratings_from_ranks(new_ranks)
-        self.live_ranks = ranks_from_ratings(self.fifa_points, tiebreak_ranks=new_ranks)
+        # 保留洲际杯结束时的真实 fifa_points / live_ranks，供 Part B 继续累加
         self._rank_source = "cycle"
         self.draw_log.append(
             {
                 "type": "world_ranks_updated",
-                "说明": "已根据洲际杯期间国际积分写入 team_world_ranks_cycle.json，Part B 使用新排名",
+                "说明": "已写入 team_world_ranks_cycle.json；Part B 沿用洲际杯结束时的国际积分（未重置）",
                 "样本前10": [n for n, _ in sorted(new_ranks.items(), key=lambda kv: kv[1])[:10]],
             }
         )
@@ -1522,15 +1608,22 @@ class Simulator:
     def _collect_prelim_winners(self) -> None:
         winners_by_confed: Dict[str, List[Team]] = {}
         wcc_losers: List[Team] = []
+        # 各洲联赛阶段期望人数（须能整除分档数）
+        expect_league_n = {
+            "UEFA": 48,
+            "AFC": 36,
+            "CONCACAF": 30,
+            "CAF": 48,
+            "OFC": 12,
+            "CONMEBOL": 10,
+        }
         for confed in CONFEDS:
             if confed == "CONMEBOL":
                 winners_by_confed[confed] = sorted(self._confed_teams(confed), key=lambda t: t.world_rank)
                 continue
             meta = self._prelim_pairs_meta[confed]
-            direct_n = len(meta["直接晋级"])
-            teams = sorted(self._confed_teams(confed), key=lambda t: t.world_rank)
-            direct = teams[:direct_n]
-            wset: Set[str] = {t.name for t in direct}
+            # 必须用抽签时锁定的直接晋级名单，不能按当前排名重切（Part A 后排名已变）
+            wset: Set[str] = set(meta["直接晋级"])
             for tie in meta["ties"]:
                 a, b = tie["seed_team"], tie["other_team"]
                 found = None
@@ -1547,7 +1640,17 @@ class Simulator:
                 wset.add(w_t.name)
                 loser = b if w_t.name == a.name else a
                 wcc_losers.append(loser)
-            winners_by_confed[confed] = [self.team_map[nm] for nm in wset]
+            winners = sorted(
+                (self.team_map[nm] for nm in wset if nm in self.team_map),
+                key=lambda t: t.world_rank,
+            )
+            exp = expect_league_n.get(confed)
+            if exp is not None and len(winners) != exp:
+                raise RuntimeError(
+                    f"{confed} 预选晋级应为 {exp} 队，实际 {len(winners)} "
+                    f"（直接 {len(meta['直接晋级'])} + 附加赛胜者；请检查抽签名单是否被重算）"
+                )
+            winners_by_confed[confed] = winners
         self._wcc_prelim_losers = sorted(wcc_losers, key=lambda t: t.world_rank)
         if len(self._wcc_prelim_losers) != 36:
             raise RuntimeError(f"挑战者杯入队应为 36，实际 {len(self._wcc_prelim_losers)}")
