@@ -18,6 +18,28 @@ EARLY_PO_SLOTS = ("P1", "P2", "P3", "P4")
 LATE_PO_SLOTS = ("P5", "P6", "P7", "P8")
 
 
+def draw_groups_from_pots(
+    pots: List[List[Any]], rng: random.Random
+) -> Tuple[List[List[Any]], List[List[str]]]:
+    """
+    给定 6 档 × 6 队，每档内随机打乱后依次落入 6 个小组，
+    使每组各含 1～6 档各一队（落位顺序即档位）。
+    """
+    if len(pots) != 6:
+        raise ValueError(f"need 6 pots, got {len(pots)}")
+    for i, pot in enumerate(pots):
+        if len(pot) != 6:
+            raise ValueError(f"pot {i + 1} needs 6 teams, got {len(pot)}")
+    groups: List[List[Any]] = [[] for _ in range(6)]
+    for pot in pots:
+        perm = pot[:]
+        rng.shuffle(perm)
+        for gi in range(6):
+            groups[gi].append(perm[gi])
+    pot_names = [[tm.name for tm in pot] for pot in pots]
+    return groups, pot_names
+
+
 def draw_six_pots_into_groups(
     teams36: List[Any], rng: random.Random
 ) -> Tuple[List[List[Any]], List[List[str]]]:
@@ -27,14 +49,7 @@ def draw_six_pots_into_groups(
     """
     t = sorted(teams36, key=lambda x: x.world_rank)
     pots = [t[6 * i : 6 * (i + 1)] for i in range(6)]
-    groups: List[List[Any]] = [[] for _ in range(6)]
-    for pot in pots:
-        perm = pot[:]
-        rng.shuffle(perm)
-        for gi in range(6):
-            groups[gi].append(perm[gi])
-    pot_names = [[tm.name for tm in pot] for pot in pots]
-    return groups, pot_names
+    return draw_groups_from_pots(pots, rng)
 
 
 def round_robin_single_even(group: List[Any], rng: random.Random) -> List[List[Tuple[Any, Any]]]:

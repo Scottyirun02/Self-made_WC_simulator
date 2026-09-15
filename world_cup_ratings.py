@@ -207,6 +207,23 @@ def match_importance(comp: str, stage: str, kind: str = "league") -> float:
             return IMPORTANCE_QUALIFIER
         return IMPORTANCE_QUALIFIER
 
+    if comp == "CC" or comp.startswith("CC-"):
+        # 联合会杯：小组赛按洲级正赛小组量级；淘汰赛按轮次（1/4决赛→半决赛→决赛）
+        if "-KO" in comp:
+            ko_i = _world_ko_importance(stage)
+            return ko_i if ko_i is not None else IMPORTANCE_QF
+        return IMPORTANCE_FINALS_GS
+
+    if comp.startswith("WSC"):
+        if "附加赛" in stage or comp.endswith("-PO"):
+            return IMPORTANCE_QF
+        ko_i = _world_ko_importance(stage)
+        if ko_i is not None:
+            return ko_i
+        if kind == "knockout":
+            return IMPORTANCE_QF
+        return IMPORTANCE_GLOBAL_GS
+
     if comp.endswith("-PRE") or stage == "Preliminary":
         return IMPORTANCE_PRELIM
     if comp.endswith("-QUAL") or "联赛第" in stage:
@@ -214,12 +231,27 @@ def match_importance(comp: str, stage: str, kind: str = "league") -> float:
     if comp in ("WC-PO", "WL-PO", "WA-PO") or "单场附加赛" in stage:
         return IMPORTANCE_PLAYOFF
 
+    if comp == "FRIENDLY" or "友谊赛" in stage:
+        return IMPORTANCE_FRIENDLY
+
     if kind == "knockout":
         ko_i = _world_ko_importance(stage)
         return ko_i if ko_i is not None else IMPORTANCE_R16
     if kind == "two_leg":
         return IMPORTANCE_PLAYOFF
     return IMPORTANCE_FRIENDLY
+
+
+def is_prelim_match(comp: str, stage: str = "") -> bool:
+    """洲内预选附加赛：场上可决胜，积分按普通预选可加可扣。"""
+    return (comp or "").endswith("-PRE") or (stage or "") == "Preliminary"
+
+
+def elo_treat_as_cup_knockout(comp: str, stage: str, kind: str) -> bool:
+    """杯赛淘汰赛败方不扣分；洲内附加赛除外。"""
+    if is_prelim_match(comp, stage):
+        return False
+    return kind == "knockout"
 
 
 def is_knockout_decisive(comp: str, stage: str, kind: str, round_num: int = 1) -> bool:

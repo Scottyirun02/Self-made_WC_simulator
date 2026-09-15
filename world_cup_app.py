@@ -18,7 +18,9 @@ if str(_ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import altair as alt
 
+from fifa_calendar import N_MATCHDAYS, format_kickoff
 from continental_cups import (
     CONTINENTAL_CODES,
     CONTINENTAL_LABELS,
@@ -31,13 +33,19 @@ from world_cup_challenger import WCC_GROUP_LABELS, build_t_slot_map, get_r16_slo
 from world_cup_game import (
     AFC_TEAMS,
     CAF_TEAMS,
+    CC_GROUP_LABELS,
+    CC_QF_PAIRINGS,
     CONCACAF_TEAMS,
     CONFEDS,
     CONMEBOL_TEAMS,
+    CUP_FINAL_RANK_LABELS,
+    CUP_FINAL_RANK_ORDER,
     OFC_TEAMS,
     Simulator,
     TABLE_ZONES,
     UEFA_TEAMS,
+    confed_ranks_from,
+    team_rank_series,
     zone_label_for_rank,
 )
 
@@ -47,6 +55,8 @@ BRACKET_CUP_LABELS = {
     "WORLD-ASSOCIATION": "世界协会杯",
     "WCC": "世界挑战者杯",
     **{c: CONTINENTAL_LABELS[c] for c in CONTINENTAL_CODES},
+    "CC": "联合会杯",
+    "WSC": "世界超级杯",
 }
 
 GROUP_STAGE_CUPS = [
@@ -54,6 +64,7 @@ GROUP_STAGE_CUPS = [
     ("AFCON", "非洲杯"),
     ("APAC", "亚太杯"),
     ("AMERICA", "美洲杯"),
+    ("CC", "联合会杯"),
     ("WORLD-CHAMPIONS", "世界冠军杯"),
     ("WORLD-LEAGUE", "世界联赛杯"),
     ("WORLD-ASSOCIATION", "世界协会杯"),
@@ -94,7 +105,7 @@ def _default_hosts() -> Dict[str, str]:
 
 
 def _ensure_sim(seed: int, hosts: Optional[Dict[str, str]] = None) -> Simulator:
-    """种子变化或尚未开局时创建；东道主仅在「新开局」时生效（由调用方清空 sim）。"""
+    """种子变化或尚未开局时创建；东道主仅在重置/新周期时生效（由调用方清空或替换 sim）。"""
     hosts = hosts or st.session_state.get("hosts") or _default_hosts()
     key_hosts = tuple(sorted(hosts.items()))
     if "sim" not in st.session_state or st.session_state.get("sim_seed") != seed:
@@ -150,6 +161,7 @@ def _matches_to_df(sim: Simulator) -> pd.DataFrame:
         rows.append(
             {
                 "比赛日": m.day,
+                "开球": format_kickoff(getattr(m, "kickoff", "") or ""),
                 "轮次": m.round_num,
                 "赛事": m.comp,
                 "阶段": m.stage,
@@ -349,6 +361,8 @@ def _draw_strength_summary_df(sim: Simulator, prefix: str) -> pd.DataFrame:
 
 def _group_zone_label(sim: Simulator, prefix: str, group_lab: str, rank: int) -> str:
     """按抽签时已锁定的组硬度，标注各队晋级区间。"""
+    if prefix == "CC":
+        return "八强（晋级淘汰赛）" if rank <= 2 else "小组出局"
     if rank == 1:
         return "16强直通（小组第一）"
     if rank == 3:
@@ -378,6 +392,8 @@ def _group_zone_label(sim: Simulator, prefix: str, group_lab: str, rank: int) ->
 def _cup_group_labels(prefix: str) -> List[str]:
     if prefix in CONTINENTAL_CODES:
         return list(FINAL_GROUP_LABELS)
+    if prefix == "CC":
+        return list(CC_GROUP_LABELS)
     return list(WCC_GROUP_LABELS)
 
 
@@ -475,7 +491,12 @@ def _render_cup_group_standings(sim: Simulator, prefix: str, cup_label: str) -> 
         return
 
     with st.expander("晋级线说明", expanded=False):
-        if is_cont:
+        if prefix == "CC":
+            st.markdown("- 参赛：四大洲杯四强共 16 队（一档欧洲/二档美洲/三档非洲/四档亚太）")
+            st.markdown("- 第 **1–2** 名：晋级八强（1/4决赛）")
+            st.markdown("- 第 **3–4** 名：小组出局")
+            st.markdown("- 淘汰赛阶段国际积分只加不扣")
+        elif is_cont:
             st.markdown("- 第 **1–2** 名：晋级 16 强")
             st.markdown("- 第 **3–4** 名：小组出局")
             st.markdown("- 东道主固定 **A1**")
@@ -550,13 +571,60 @@ def _prelim_results_df(sim: Simulator, confed: str) -> pd.DataFrame:
             sc = f"{sc} ({note})"
         rows.append(
             {
+                "轮次": m.round_num,
+                "阶段": m.stage,
                 "比赛日": m.day,
+                "开球": format_kickoff(getattr(m, "kickoff", "") or ""),
                 "主队": m.home.name,
                 "比分": sc,
                 "客队": m.away.name,
                 "晋级": w,
             }
         )
+    rows.sort(key=lambda r: (int(r["轮次"] or 0), int(r["比赛日"] or 0), r["主队"]))
+    return pd.DataFrame(rows)
+
+
+def _prelim_bracket_df(sim: Simulator, confed: str) -> pd.DataFrame:
+    state = getattr(sim, "_prelim_state", None) or {}
+    stt = state.get(confed) or {}
+    rounds = stt.get("rounds") or {}
+    if not rounds:
+        return pd.DataFrame()
+    rows = []
+    for rnd in sorted(rounds):
+        for tie in rounds[rnd]:
+            seq = int(tie.get("序号") or 0)
+            rec = (stt.get("resolved") or {}).get((rnd, seq))
+            score = "—"
+            winner = rec["winner"] if rec else "—"
+            tid = f"{confed}-PRE-R{rnd}-{seq}"
+            for m in sim.all_results:
+                if m.tie_id == tid and m.played:
+                    note = (m.score_note or "").strip()
+                    score = f"{m.hg}-{m.ag}"
+                    if note:
+                        score = f"{score} ({note})"
+                    break
+            dest = {
+                "caf_1v2": "胜者进联赛 / 败者进第二轮",
+                "caf_3v4": "胜者进第二轮 / 败者出局",
+                "caf_r2": "胜者进联赛 / 败者出局",
+            }.get(tie.get("path", "ladder"), "")
+            if not dest:
+                last = rnd >= int(stt.get("max_round") or 0)
+                dest = "胜者进联赛 / 败者出局" if last else "胜者进下一轮 / 败者出局"
+            rows.append(
+                {
+                    "轮次": rnd,
+                    "场次": seq,
+                    "主队（一档）": sim.prelim_filled_label(confed, tie.get("home") or {}),
+                    "客队（二档）": sim.prelim_filled_label(confed, tie.get("away") or {}),
+                    "比分": score,
+                    "晋级": winner,
+                    "去向": dest,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -855,6 +923,12 @@ def _svg_connector_aligned(h: int, n: int) -> str:
     return "".join(f'<path d="M 0,{y:.1f} H 28" />' for y in ys)
 
 
+def _svg_connector_one(h: int, n: int, idx: int) -> str:
+    """n 个槽位中只连接第 idx 条（0-based），用于超级杯第一轮喂入其中一场第二轮。"""
+    ys = [y * h for y in _slot_centers(n)]
+    return f'<path d="M 0,{ys[idx]:.1f} H 28" />'
+
+
 def _cup_knockout_bracket_text(
     rounds: Dict[str, Any], cup_base: str, sim: Simulator, r16_slots: List[Tuple[str, str, str]]
 ) -> List[str]:
@@ -983,14 +1057,17 @@ def _match_card_html(m: Any, label: str, *, final: bool = False) -> str:
             f'<div class="mc-row"><span class="mc-team">待定</span><span class="mc-score">—</span></div></div>'
         )
     if not getattr(m, "played", False):
-        return _fixed_pair_card_html(label, m.home.name, m.away.name)
+        ko = format_kickoff(getattr(m, "kickoff", "") or "")
+        meta = " · ".join(x for x in [label, ko] if x)
+        return _fixed_pair_card_html(meta, m.home.name, m.away.name)
     wname = _match_winner_name(m)
     note = (m.score_note or "").strip()
     pen = ""
     if "点球" in note:
         pen = "点"
     day = f"第{m.day}比赛日" if m.day else ""
-    meta = " · ".join(x for x in [label, day] if x)
+    ko = format_kickoff(getattr(m, "kickoff", "") or "")
+    meta = " · ".join(x for x in [label, day, ko] if x)
     home_w = wname == m.home.name
     away_w = wname == m.away.name
     return (
@@ -1428,6 +1505,418 @@ def _cont_knockout_slots_df(sim: Simulator, cup_base: str, rounds: Dict[str, Any
     return pd.DataFrame(rows)
 
 
+def _cc_knockout_rounds(sim: Simulator) -> Dict[str, Any]:
+    """联合会杯淘汰赛各轮次：已赛果 + 已排期未赛（八强起，无 16 强轮）。"""
+
+    def _round(stage_pred) -> List[Any]:
+        played = [
+            m for m in sim.all_results if m.comp == "CC-KO" and m.played and stage_pred(m.stage)
+        ]
+        played.sort(key=lambda x: (x.day, x.round_num))
+        if played:
+            return played
+        sched = [
+            m for m in _iter_scheduled_matches(sim) if m.comp == "CC-KO" and stage_pred(m.stage)
+        ]
+        sched.sort(key=lambda x: x.round_num)
+        return sched
+
+    qf = _round(lambda st: st.startswith("1/4决赛"))
+    sf = _round(lambda st: st.startswith("半决赛"))
+    fin_list = _round(lambda st: st == "决赛")
+    return {"qf": qf, "sf": sf, "fin": fin_list[0] if fin_list else None}
+
+
+def _cc_knockout_slots_df(sim: Simulator, rounds: Dict[str, Any]) -> pd.DataFrame:
+    """联合会杯淘汰赛对阵表：小组抽签后展示占位，落位/赛果确定后填队名。"""
+    rows = []
+    qf_map = _match_list_by_round(rounds["qf"])
+    sf_map = _match_list_by_round(rounds["sf"])
+    for qi, (a, b) in enumerate(CC_QF_PAIRINGS):
+        m = qf_map.get(qi)
+        rows.append(
+            {
+                "轮次": "1/4决赛",
+                "场次": f"QF{qi + 1}",
+                "签位": f"{a} vs {b}",
+                "主队": m.home.name if m else _resolve_gs_slot_name(sim, "CC", a),
+                "比分": f"{m.hg}-{m.ag}" if m else "—",
+                "客队": m.away.name if m else _resolve_gs_slot_name(sim, "CC", b),
+                "胜者": _match_winner_name(m) if m else "—",
+            }
+        )
+    for si, (i, j) in enumerate(SF_FROM_QF):
+        m = sf_map.get(si)
+        rows.append(
+            {
+                "轮次": "半决赛",
+                "场次": f"SF{si + 1}",
+                "签位": f"QF{i + 1}胜 vs QF{j + 1}胜",
+                "主队": m.home.name if m else _winner_or_placeholder(qf_map.get(i), f"QF{i + 1}胜者"),
+                "比分": f"{m.hg}-{m.ag}" if m else "—",
+                "客队": m.away.name if m else _winner_or_placeholder(qf_map.get(j), f"QF{j + 1}胜者"),
+                "胜者": _match_winner_name(m) if m else "—",
+            }
+        )
+    m = rounds["fin"]
+    rows.append(
+        {
+            "轮次": "决赛",
+            "场次": "F",
+            "签位": "SF1胜 vs SF2胜",
+            "主队": m.home.name if m else _winner_or_placeholder(sf_map.get(0), "SF1胜者"),
+            "比分": f"{m.hg}-{m.ag}" if m else "—",
+            "客队": m.away.name if m else _winner_or_placeholder(sf_map.get(1), "SF2胜者"),
+            "胜者": _match_winner_name(m) if m else "—",
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def _cc_knockout_bracket_text(sim: Simulator, rounds: Dict[str, Any]) -> List[str]:
+    lines: List[str] = ["【联合会杯 淘汰赛】", "1/4决赛"]
+    qf_map = _match_list_by_round(rounds["qf"])
+    sf_map = _match_list_by_round(rounds["sf"])
+    for qi, (a, b) in enumerate(CC_QF_PAIRINGS):
+        m = qf_map.get(qi)
+        if m:
+            lines.append(
+                f"  [QF{qi + 1}] {a} vs {b}: "
+                f"{m.home.name} {m.hg}-{m.ag} {m.away.name}  →  {_match_winner_name(m)}"
+            )
+        else:
+            lines.append(
+                f"  [QF{qi + 1}] {a}→{_resolve_gs_slot_name(sim, 'CC', a)}  vs  "
+                f"{b}→{_resolve_gs_slot_name(sim, 'CC', b)}"
+            )
+    lines.append("半决赛")
+    for si, (i, j) in enumerate(SF_FROM_QF):
+        m = sf_map.get(si)
+        if m:
+            lines.append(
+                f"  [SF{si + 1}] {m.home.name} {m.hg}-{m.ag} {m.away.name}  →  {_match_winner_name(m)}"
+            )
+        else:
+            a = _winner_or_placeholder(qf_map.get(i), f"QF{i + 1}胜者")
+            b = _winner_or_placeholder(qf_map.get(j), f"QF{j + 1}胜者")
+            lines.append(f"  [SF{si + 1}] {a} vs {b}")
+    lines.append("决赛")
+    if rounds["fin"]:
+        m = rounds["fin"]
+        lines.append(
+            f"  {m.home.name} {m.hg}-{m.ag} {m.away.name}  →  冠军 {_match_winner_name(m)}"
+        )
+    else:
+        a = _winner_or_placeholder(sf_map.get(0), "SF1胜者")
+        b = _winner_or_placeholder(sf_map.get(1), "SF2胜者")
+        lines.append(f"  {a} vs {b}")
+    return lines
+
+
+def _cc_qf_card_html(sim: Simulator, rounds: Dict[str, Any], qi: int) -> str:
+    """联合会杯 1/4决赛卡片：有赛果用赛果；否则用小组名次占位（A1 vs B2 等）。"""
+    qf_map = _match_list_by_round(rounds["qf"])
+    a, b = CC_QF_PAIRINGS[qi]
+    meta = f"QF{qi + 1} · {a} vs {b}"
+    if qi in qf_map:
+        return _match_card_html(qf_map[qi], meta)
+    return _fixed_pair_card_html(
+        meta,
+        _resolve_gs_slot_name(sim, "CC", a),
+        _resolve_gs_slot_name(sim, "CC", b),
+    )
+
+
+def _cc_knockout_bracket_html(sim: Simulator, rounds: Dict[str, Any]) -> str:
+    """联合会杯淘汰赛树：分组抽签后即可显示八强占位签表。"""
+    if not getattr(sim, "_cc_groups", None):
+        return ""
+    h = 560
+    qf_cards = [_cc_qf_card_html(sim, rounds, i) for i in range(4)]
+    sf_cards = [_cont_sf_card_html(rounds, i) for i in range(2)]
+    fin_card = _cont_final_card_html(rounds)
+    body = (
+        '<div class="bracket-board">'
+        + _round_col_html("1/4决赛", qf_cards, h)
+        + _link_col_html(h, _svg_connector_merge(h, 4, [(0, 1), (2, 3)]))
+        + _round_col_html("半决赛", sf_cards, h)
+        + _link_col_html(h, _svg_connector_merge(h, 2, [(0, 1)]))
+        + _round_col_html("决赛", [fin_card], h)
+        + "</div>"
+    )
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+        f"<style>{BRACKET_CSS}</style></head><body>{body}</body></html>"
+    )
+
+
+def _wsc_find_match(sim: Simulator, stage: str) -> Any:
+    for m in sim.all_results:
+        if m.comp in ("WSC-PO", "WSC-KO") and m.played and m.stage == stage:
+            return m
+    for m in _iter_scheduled_matches(sim):
+        if m.comp in ("WSC-PO", "WSC-KO") and m.stage == stage:
+            return m
+    return None
+
+
+def _wsc_pair_card(sim: Simulator, stage: str, meta: str, left: str, right: str) -> str:
+    m = _wsc_find_match(sim, stage)
+    if m is not None:
+        return _match_card_html(m, meta, final=(stage == "决赛"))
+    return _fixed_pair_card_html(meta, left, right)
+
+
+def _wsc_knockout_slots_df(sim: Simulator) -> pd.DataFrame:
+    """开赛即锁定的超级杯对阵表；赛果确定后填入比分与胜者。"""
+    slots = getattr(sim, "_wsc_slots", {}) or {}
+    if not slots:
+        return pd.DataFrame()
+
+    def _row(
+        round_name: str,
+        slot_id: str,
+        pairing: str,
+        stage: str,
+        left: str,
+        right: str,
+        venue: str,
+    ) -> Dict[str, Any]:
+        m = _wsc_find_match(sim, stage)
+        played = m is not None and getattr(m, "played", False)
+        return {
+            "轮次": round_name,
+            "场次": slot_id,
+            "签位": pairing,
+            "场地": venue,
+            "主队": m.home.name if m is not None else left,
+            "比分": f"{m.hg}-{m.ag}" if played else "—",
+            "客队": m.away.name if m is not None else right,
+            "胜者": _match_winner_name(m) if played else "—",
+        }
+
+    po1u_w = _winner_or_placeholder(_wsc_find_match(sim, "附加赛第一轮·上半区"), "第一轮上半区胜者")
+    po1l_w = _winner_or_placeholder(_wsc_find_match(sim, "附加赛第一轮·下半区"), "第一轮下半区胜者")
+    po2u_w = _winner_or_placeholder(_wsc_find_match(sim, "附加赛第二轮·上半区"), "第二轮上半区胜者")
+    po2l_w = _winner_or_placeholder(_wsc_find_match(sim, "附加赛第二轮·下半区"), "第二轮下半区胜者")
+    sfu_w = _winner_or_placeholder(_wsc_find_match(sim, "半决赛·上半区"), "上半区胜者")
+    sfl_w = _winner_or_placeholder(_wsc_find_match(sim, "半决赛·下半区"), "下半区胜者")
+    rows = [
+        _row(
+            "附加赛第一轮",
+            "PO1上",
+            "一档（联赛冠/亚军）主场 vs 二档",
+            "附加赛第一轮·上半区",
+            slots["po1_upper_home"].name,
+            slots["po1_upper_away"].name,
+            "主场（一档）",
+        ),
+        _row(
+            "附加赛第一轮",
+            "PO1下",
+            "一档（联赛冠/亚军）主场 vs 二档",
+            "附加赛第一轮·下半区",
+            slots["po1_lower_home"].name,
+            slots["po1_lower_away"].name,
+            "主场（一档）",
+        ),
+        _row(
+            "附加赛第二轮",
+            "PO2上",
+            "一档（冠军杯3-4名）主场 vs 第一轮胜者",
+            "附加赛第二轮·上半区",
+            slots["po2_upper_home"].name,
+            po1u_w,
+            "主场（一档）",
+        ),
+        _row(
+            "附加赛第二轮",
+            "PO2下",
+            "一档（冠军杯3-4名）主场 vs 第一轮胜者",
+            "附加赛第二轮·下半区",
+            slots["po2_lower_home"].name,
+            po1l_w,
+            "主场（一档）",
+        ),
+        _row(
+            "半决赛",
+            "SF上",
+            "世界冠军杯冠军 vs 第二轮上半区胜者",
+            "半决赛·上半区",
+            slots["wc_champion"].name,
+            po2u_w,
+            "中立",
+        ),
+        _row(
+            "半决赛",
+            "SF下",
+            "世界冠军杯亚军 vs 第二轮下半区胜者",
+            "半决赛·下半区",
+            slots["wc_runner_up"].name,
+            po2l_w,
+            "中立",
+        ),
+        _row(
+            "决赛",
+            "F",
+            "上半区胜者 vs 下半区胜者",
+            "决赛",
+            sfu_w,
+            sfl_w,
+            "中立",
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
+def _wsc_knockout_bracket_text(sim: Simulator) -> List[str]:
+    slots = getattr(sim, "_wsc_slots", {}) or {}
+    if not slots:
+        return []
+    q = slots.get("rank_qualifier")
+    qn = q.name if q is not None else "—"
+    lines = [
+        "【世界超级杯】",
+        f"排名递补：{qn}",
+        "附加赛第一轮（一档主场）",
+    ]
+    for lab, stage, hk, ak in (
+        ("上", "附加赛第一轮·上半区", "po1_upper_home", "po1_upper_away"),
+        ("下", "附加赛第一轮·下半区", "po1_lower_home", "po1_lower_away"),
+    ):
+        m = _wsc_find_match(sim, stage)
+        if m:
+            lines.append(
+                f"  [PO1{lab}] {m.home.name} {m.hg}-{m.ag} {m.away.name}  →  {_match_winner_name(m)}"
+                if m.played
+                else f"  [PO1{lab}] {m.home.name}（主） vs {m.away.name}（客）"
+            )
+        else:
+            lines.append(f"  [PO1{lab}] {slots[hk].name}（主） vs {slots[ak].name}（客）")
+    lines.append("附加赛第二轮（冠军杯3-4名主场）")
+    for lab, stage, hk, po1_stage in (
+        ("上", "附加赛第二轮·上半区", "po2_upper_home", "附加赛第一轮·上半区"),
+        ("下", "附加赛第二轮·下半区", "po2_lower_home", "附加赛第一轮·下半区"),
+    ):
+        m = _wsc_find_match(sim, stage)
+        if m:
+            lines.append(
+                f"  [PO2{lab}] {m.home.name} {m.hg}-{m.ag} {m.away.name}  →  {_match_winner_name(m)}"
+                if m.played
+                else f"  [PO2{lab}] {m.home.name}（主） vs {m.away.name}（客）"
+            )
+        else:
+            opp = _winner_or_placeholder(_wsc_find_match(sim, po1_stage), "第一轮胜者")
+            lines.append(f"  [PO2{lab}] {slots[hk].name}（主） vs {opp}（客）")
+    lines.append("半决赛（中立）")
+    for lab, stage, seed_key, po2_stage in (
+        ("上", "半决赛·上半区", "wc_champion", "附加赛第二轮·上半区"),
+        ("下", "半决赛·下半区", "wc_runner_up", "附加赛第二轮·下半区"),
+    ):
+        m = _wsc_find_match(sim, stage)
+        if m:
+            lines.append(
+                f"  [SF{lab}] {m.home.name} {m.hg}-{m.ag} {m.away.name}  →  {_match_winner_name(m)}"
+                if m.played
+                else f"  [SF{lab}] {m.home.name} vs {m.away.name}"
+            )
+        else:
+            opp = _winner_or_placeholder(_wsc_find_match(sim, po2_stage), "第二轮胜者")
+            lines.append(f"  [SF{lab}] {slots[seed_key].name} vs {opp}")
+    lines.append("决赛（中立）")
+    m = _wsc_find_match(sim, "决赛")
+    if m:
+        lines.append(
+            f"  {m.home.name} {m.hg}-{m.ag} {m.away.name}  →  冠军 {_match_winner_name(m)}"
+            if m.played
+            else f"  {m.home.name} vs {m.away.name}"
+        )
+    else:
+        a = _winner_or_placeholder(_wsc_find_match(sim, "半决赛·上半区"), "上半区胜者")
+        b = _winner_or_placeholder(_wsc_find_match(sim, "半决赛·下半区"), "下半区胜者")
+        lines.append(f"  {a} vs {b}")
+    return lines
+
+
+def _wsc_knockout_bracket_html(sim: Simulator) -> str:
+    """世界超级杯签表树：开赛抽签后即可显示全部占位。"""
+    slots = getattr(sim, "_wsc_slots", {}) or {}
+    if not slots:
+        return ""
+    h = 520
+    po1_cards = [
+        _wsc_pair_card(
+            sim,
+            "附加赛第一轮·上半区",
+            "PO1上 · 一档主场",
+            slots["po1_upper_home"].name,
+            slots["po1_upper_away"].name,
+        ),
+        _wsc_pair_card(
+            sim,
+            "附加赛第一轮·下半区",
+            "PO1下 · 一档主场",
+            slots["po1_lower_home"].name,
+            slots["po1_lower_away"].name,
+        ),
+    ]
+    po2_cards = [
+        _wsc_pair_card(
+            sim,
+            "附加赛第二轮·上半区",
+            "PO2上 · 3-4名主场",
+            slots["po2_upper_home"].name,
+            _winner_or_placeholder(_wsc_find_match(sim, "附加赛第一轮·上半区"), "第一轮上半区胜者"),
+        ),
+        _wsc_pair_card(
+            sim,
+            "附加赛第二轮·下半区",
+            "PO2下 · 3-4名主场",
+            slots["po2_lower_home"].name,
+            _winner_or_placeholder(_wsc_find_match(sim, "附加赛第一轮·下半区"), "第一轮下半区胜者"),
+        ),
+    ]
+    sf_cards = [
+        _wsc_pair_card(
+            sim,
+            "半决赛·上半区",
+            "SF上 · 中立",
+            slots["wc_champion"].name,
+            _winner_or_placeholder(_wsc_find_match(sim, "附加赛第二轮·上半区"), "第二轮上半区胜者"),
+        ),
+        _wsc_pair_card(
+            sim,
+            "半决赛·下半区",
+            "SF下 · 中立",
+            slots["wc_runner_up"].name,
+            _winner_or_placeholder(_wsc_find_match(sim, "附加赛第二轮·下半区"), "第二轮下半区胜者"),
+        ),
+    ]
+    fin_card = _wsc_pair_card(
+        sim,
+        "决赛",
+        "决赛 · 中立",
+        _winner_or_placeholder(_wsc_find_match(sim, "半决赛·上半区"), "上半区胜者"),
+        _winner_or_placeholder(_wsc_find_match(sim, "半决赛·下半区"), "下半区胜者"),
+    )
+    body = (
+        '<div class="bracket-board">'
+        + _round_col_html("附加赛第一轮", po1_cards, h)
+        + _link_col_html(h, _svg_connector_aligned(h, 2))
+        + _round_col_html("附加赛第二轮", po2_cards, h)
+        + _link_col_html(h, _svg_connector_aligned(h, 2))
+        + _round_col_html("半决赛", sf_cards, h)
+        + _link_col_html(h, _svg_connector_merge(h, 2, [(0, 1)]))
+        + _round_col_html("决赛", [fin_card], h)
+        + "</div>"
+    )
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+        f"<style>{BRACKET_CSS}</style></head><body>{body}</body></html>"
+    )
+
+
+
 def _cont_knockout_bracket_html(rounds: Dict[str, Any], cup_base: str, sim: Simulator) -> str:
     """洲际杯传统淘汰赛树：正赛分组抽签后即可显示占位签表。"""
     if cup_base not in getattr(sim, "_cont_finals_groups", {}):
@@ -1850,13 +2339,67 @@ def _world_rank_board_df(sim: Simulator) -> pd.DataFrame:
             {
                 "世界排名": sim.live_ranks.get(t.name, t.world_rank),
                 "球队": t.name,
-                "大洲": t.confed,
+                "大洲": CONFED_LABELS.get(t.confed, t.confed),
                 "国际积分": round(sim.fifa_points.get(t.name, 0.0), 1),
                 "OVR": round(t.ovr, 1),
             }
             for t in board
         ]
     )
+
+
+def _confed_rank_board_df(sim: Simulator, confed: str) -> pd.DataFrame:
+    """某一大洲内部排名表（1…n，无断号）。"""
+    cr = confed_ranks_from(sim.teams, sim.live_ranks)
+    board = [t for t in sim.teams if t.confed == confed]
+    board.sort(key=lambda t: (cr.get(t.name, 999), t.name))
+    return pd.DataFrame(
+        [
+            {
+                "大洲排名": cr.get(t.name, "—"),
+                "球队": t.name,
+                "世界排名": sim.live_ranks.get(t.name, t.world_rank),
+                "国际积分": round(sim.fifa_points.get(t.name, 0.0), 1),
+                "OVR": round(t.ovr, 1),
+            }
+            for t in board
+        ]
+    )
+
+
+def _one_rank_line(df: pd.DataFrame, y_col: str, title: str):
+    chart = (
+        alt.Chart(df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("比赛日:Q", axis=alt.Axis(tickMinStep=1, title="比赛日")),
+            y=alt.Y(
+                f"{y_col}:Q",
+                scale=alt.Scale(reverse=True, zero=False),
+                axis=alt.Axis(tickMinStep=1, title=f"{title}（1 最好，已反向）"),
+            ),
+            tooltip=["比赛日", y_col],
+        )
+        .properties(height=280)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def _rank_history_chart(sim: Simulator, team_name: str):
+    """选中国家的世界排名、大洲排名各一张折线图。"""
+    series = team_rank_series(sim, team_name)
+    if not series:
+        st.caption("暂无排名历史。")
+        return
+    df = pd.DataFrame(series)
+    c_w, c_c = st.columns(2)
+    with c_w:
+        st.markdown("**世界排名**")
+        _one_rank_line(df, "世界排名", "世界排名")
+    with c_c:
+        st.markdown("**大洲排名**")
+        _one_rank_line(df, "大洲排名", "大洲排名")
+    st.caption("第 0 日为开局；每个比赛日记录一次重排后的名次。名次越小越好，图中越靠上越好。")
 
 
 MAIN_PAGES = [
@@ -1881,6 +2424,7 @@ def _hosts_from_session() -> Dict[str, str]:
 
 
 def _reset_sim_session() -> None:
+    """从原始排名库重开第一个四年周期。"""
     st.session_state.pop("sim", None)
     st.session_state.pop("sim_seed", None)
     st.session_state.pop("sim_hosts", None)
@@ -1889,6 +2433,27 @@ def _reset_sim_session() -> None:
     hosts = _hosts_from_session()
     st.session_state.hosts = hosts
     _ensure_sim(seed, hosts)
+
+
+def _start_next_cycle() -> None:
+    """在上个周期的排名/积分/OVR 上开新四年周期，重新抽签。"""
+    prev = st.session_state.get("sim")
+    if prev is None:
+        return
+    snap = prev.carry_snapshot()
+    seed = int(st.session_state.get("seed", 42))
+    hosts = _hosts_from_session()
+    st.session_state.hosts = hosts
+    st.session_state.pop("rank_change_report", None)
+    nxt = Simulator(
+        seed,
+        hosts=hosts,
+        carry=snap,
+        cycle_index=int(snap.get("cycle_index") or 1) + 1,
+    )
+    st.session_state.sim = nxt
+    st.session_state.sim_seed = seed
+    st.session_state.sim_hosts = tuple(sorted(hosts.items()))
 
 
 def _advance_n_days() -> None:
@@ -1942,8 +2507,8 @@ def main() -> None:
     st.title("⚽ 四年周期模拟器：洲际杯 → 世界杯三大杯")
     st.caption(
         "Part A 欧洲杯/非洲杯/亚太杯/美洲杯（主客双循环预选 + 32 队正赛）→ "
-        "Part B 世界杯预选与三大杯/挑战者杯 · 排名见 data/team_world_ranks_original.json（回溯）"
-        "与 team_world_ranks_cycle.json（Part A 后更新）"
+        "联合会杯插在联赛第 11/12 轮之间 → "
+        "Part B 世界杯预选与三大杯/挑战者杯 · 每个周期 68 个比赛日（见 fifa_calendar.py）"
     )
 
     if "hosts" not in st.session_state:
@@ -1981,9 +2546,19 @@ def main() -> None:
 
         col_a, col_b = st.columns(2)
         with col_a:
-            st.button("新开局", use_container_width=True, on_click=_reset_sim_session)
+            st.button(
+                "重置回初始状态",
+                use_container_width=True,
+                on_click=_reset_sim_session,
+                key="btn_reset_sidebar",
+            )
         with col_b:
-            st.button("重置种子并开局", use_container_width=True, on_click=_reset_sim_session)
+            st.button(
+                "重置种子并开局",
+                use_container_width=True,
+                on_click=_reset_sim_session,
+                key="btn_reset_seed",
+            )
 
         sim = _ensure_sim(int(seed), host_vals)
 
@@ -2005,8 +2580,10 @@ def main() -> None:
         st.divider()
         st.subheader("状态")
         part_lab = "洲际杯 (Part A)" if getattr(sim, "cycle_part", "A") == "A" else "世界杯周期 (Part B)"
+        st.write(f"**四年周期:** {sim.cycle_years_label()}（第 {getattr(sim, 'cycle_index', 1)} 个）")
         st.write(f"**周期部分:** {part_lab}")
-        st.write(f"**当前比赛日:** {sim.day}")
+        st.write(f"**当前比赛日:** {sim.day} / {N_MATCHDAYS}")
+        st.write(f"**开球:** {sim.next_kickoff_display() or '—'}")
         st.write(f"**阶段:** {sim.phase_name or '—'}")
         st.caption(
             "东道主："
@@ -2027,10 +2604,28 @@ def main() -> None:
                     "**三大杯冠军：** "
                     + " | ".join(f"{k}: **{v}**" for k, v in sim.cup_champions.items())
                 )
+            if getattr(sim, "cc_champion", ""):
+                st.markdown(f"**联合会杯冠军：** **{sim.cc_champion}**")
             if getattr(sim, "wcc_champion", ""):
                 st.markdown(f"**挑战者杯冠军：** **{sim.wcc_champion}**")
+            if getattr(sim, "wsc_champion", ""):
+                st.markdown(f"**世界超级杯冠军：** **{sim.wsc_champion}**")
+            st.caption("可先改侧栏种子或东道主，再开始下一周期。")
+            st.button(
+                "开始新周期（继承排名/积分/OVR）",
+                type="primary",
+                use_container_width=True,
+                on_click=_start_next_cycle,
+                key="btn_next_cycle",
+            )
+            st.button(
+                "重置回初始状态",
+                use_container_width=True,
+                on_click=_reset_sim_session,
+                key="btn_reset_ended",
+            )
         else:
-            left = sum(len(d) for d in sim.phase_matchdays) if sim.phase_matchdays else 0
+            left = len(sim.phase_matchdays) if sim.phase_matchdays else 0
             st.caption(f"本阶段剩余比赛日: {left}")
 
     sim = _ensure_sim(int(seed), st.session_state.hosts)
@@ -2150,14 +2745,16 @@ def main() -> None:
                 )
 
     elif page == "总览":
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             st.metric("已赛总场次", len(sim.all_results))
         with c2:
             st.metric("涉及赛事数", len(sim.list_competitions()))
         with c3:
-            st.metric("阶段", sim.phase_idx)
+            st.metric("四年周期", sim.cycle_years_label())
         with c4:
+            st.metric("阶段", sim.phase_idx)
+        with c5:
             st.metric("种子", sim.seed)
 
         if getattr(sim, "continental_champions", None):
@@ -2168,12 +2765,18 @@ def main() -> None:
                     for k, v in sim.continental_champions.items()
                 )
             )
+        if getattr(sim, "cc_champion", ""):
+            st.success(f"联合会杯冠军：**{sim.cc_champion}**")
         if getattr(sim, "wcc_champion", ""):
             st.success(f"世界挑战者杯冠军：**{sim.wcc_champion}**")
+        if getattr(sim, "wsc_champion", ""):
+            st.success(f"世界超级杯冠军：**{sim.wsc_champion}**")
 
         st.subheader("周期与东道主")
         st.write(
-            f"当前：**{'Part A 洲际杯' if getattr(sim,'cycle_part','A')=='A' else 'Part B 世界杯周期'}** · "
+            f"当前：**{sim.cycle_years_label()}**（第 {getattr(sim,'cycle_index', 1)} 个四年周期）· "
+            f"{'Part A 洲际杯' if getattr(sim,'cycle_part','A')=='A' else 'Part B 世界杯周期'} · "
+            f"开球 {sim.next_kickoff_display() or '—'} · "
             f"排名源：`{getattr(sim, '_rank_source', 'original')}`"
         )
         st.caption(
@@ -2206,6 +2809,55 @@ def main() -> None:
             st.dataframe(df.tail(15), use_container_width=True, hide_index=True)
 
     elif page == "全部赛果":
+        rank_store = getattr(sim, "_cup_final_rankings", None) or {}
+        ready = [c for c in CUP_FINAL_RANK_ORDER if rank_store.get(c)]
+        st.subheader("杯赛最终排名")
+        if not ready:
+            st.caption("杯赛淘汰赛全部结束后生成。排名：先比走到哪一轮，同轮次累计常规时间 PTS/GD/GF（不含加时/点球）。")
+        else:
+            st.caption(
+                "先比淘汰轮次，同轮次比小组赛至该轮的常规时间 PTS→GD→GF。"
+                "三大杯/挑战者杯：16/8/4 强内打过 24 进 16 附加赛的排在直通队之后。"
+            )
+            lab_to_code = {CUP_FINAL_RANK_LABELS.get(c, c): c for c in ready}
+            pick_lab = st.selectbox("选择杯赛", list(lab_to_code.keys()), key="cup_rank_pick")
+            code = lab_to_code[pick_lab]
+            rows = list(rank_store.get(code) or [])
+            confed_opts = sorted({r.get("confed") for r in rows if r.get("confed")})
+            f_c = st.selectbox(
+                "筛选协会",
+                ["全部"] + [CONFED_LABELS.get(c, c) for c in confed_opts],
+                key="cup_rank_confed",
+            )
+            if f_c != "全部":
+                want = next((k for k, v in CONFED_LABELS.items() if v == f_c), f_c)
+                rows = [r for r in rows if r.get("confed") == want]
+            show_po = any("via_playoff" in r for r in rows)
+            table_rows = []
+            for r in rows:
+                item = {
+                    "排名": r.get("rank"),
+                    "国家": r.get("team"),
+                    "协会": CONFED_LABELS.get(r.get("confed", ""), r.get("confed")),
+                    "淘汰轮次": r.get("exit"),
+                    "PTS": r.get("PTS"),
+                    "GD": r.get("GD"),
+                    "GF": r.get("GF"),
+                }
+                if show_po:
+                    item["24进16附加赛"] = "是" if r.get("via_playoff") else "否"
+                table_rows.append(item)
+            rdf = pd.DataFrame(table_rows)
+            st.dataframe(rdf, use_container_width=True, hide_index=True, height=min(520, 80 + 28 * max(len(rdf), 4)))
+            st.download_button(
+                f"下载「{pick_lab}」最终排名 CSV",
+                rdf.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"cup_rank_{code}_seed{sim.seed}.csv",
+                mime="text/csv",
+                key="dl_cup_rank",
+            )
+        st.divider()
+        st.subheader("全部比赛")
         df = _matches_to_df(sim)
         if df.empty:
             st.info("暂无赛果。请在左侧推进比赛日。")
@@ -2369,13 +3021,38 @@ def main() -> None:
                 )
 
             st.divider()
-            st.subheader(f"{CONFED_LABELS.get(confed_pick, confed_pick)} · 第一阶段单场附加赛")
+            st.subheader(f"{CONFED_LABELS.get(confed_pick, confed_pick)} · 洲内多轮附加赛")
             if confed_pick == "CONMEBOL":
                 st.caption("南美预选赛无洲内附加赛，10 队直接进入联赛双循环。")
+            elif confed_pick == "CAF":
+                st.caption(
+                    "直通优先非洲杯正赛队，不足按世界排名补至 42。"
+                    "第一轮 1档vs2档胜者进联赛、3档vs4档败者出局；"
+                    "第二轮为 1vs2 败者（主场）对 3vs4 胜者。单场决胜；积分按预选可加可扣。"
+                )
+            elif confed_pick == "OFC":
+                st.caption("直通为世界排名前 11；第 12 名主场对第 13 名单场决胜。积分按预选可加可扣。")
+            else:
+                st.caption(
+                    "直通优先该协会洲际杯正赛队（超额按正赛最终排名截取），不足按世界排名补。"
+                    "剩余队按开赛世界排名套原阶梯对阵（开赛写满，后轮只填占位）。"
+                    "单场决胜，一档主场；积分按预选可加可扣。"
+                )
+            stt = (getattr(sim, "_prelim_state", None) or {}).get(confed_pick) or {}
+            if stt.get("direct"):
+                st.caption(
+                    f"直通 {len(stt.get('direct') or [])} 队"
+                    f"（洲际杯 {len(stt.get('direct_cup') or [])} · 排名补位 {len(stt.get('direct_fill') or [])}）。"
+                )
+            br_df = _prelim_bracket_df(sim, confed_pick)
+            if not br_df.empty:
+                st.markdown("**开赛对阵表**")
+                st.dataframe(br_df, use_container_width=True, hide_index=True)
             pre_df = _prelim_results_df(sim, confed_pick)
             if pre_df.empty:
                 st.info("暂无附加赛赛果（可能尚未进行或该洲无附加赛）。")
             else:
+                st.markdown("**赛果**")
                 st.dataframe(pre_df, use_container_width=True, hide_index=True)
                 st.download_button(
                     f"下载 {pre_comp} 赛果 CSV",
@@ -2390,7 +3067,7 @@ def main() -> None:
         st.caption(
             "贴近 FIFA SUM：ΔP = I×(W−We)，We 用 600 分档；"
             "I≈10/15/25/35/50；主场+100；大洲权重仅轻度修正；无净胜球放大、无淘汰赛定额奖励。"
-            "杯赛淘汰赛（含 24 强附加赛）败方不扣分；预选/小组赛仍可扣分。"
+            "杯赛淘汰赛（含 24 强附加赛）败方不扣分；洲内附加赛与预选/小组赛仍可扣分。"
             "Part A 结束写入 team_world_ranks_cycle.json。"
         )
         q_team = st.selectbox(
@@ -2402,28 +3079,56 @@ def main() -> None:
             rk = sim.live_ranks.get(q_team, sim.team_map[q_team].world_rank)
             pts = sim.fifa_points.get(q_team, 0.0)
             last = next((r for r in sim.last_day_ranking_delta if r["球队"] == q_team), None)
-            c1, c2, c3 = st.columns(3)
+            confed_ranks = confed_ranks_from(sim.teams, sim.live_ranks)
+            crk = confed_ranks.get(q_team)
+            confed_lab = CONFED_LABELS.get(sim.team_map[q_team].confed, sim.team_map[q_team].confed)
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("世界排名", rk, delta=(last["排名变化"] if last else None))
-            c2.metric("国际积分", round(pts, 1), delta=(last["积分变化"] if last else None))
-            c3.metric("大洲", sim.team_map[q_team].confed)
+            c2.metric("大洲排名", crk if crk is not None else "—")
+            c3.metric("国际积分", round(pts, 1), delta=(last["积分变化"] if last else None))
+            c4.metric("大洲", confed_lab)
             if last:
                 st.caption(
                     f"上个比赛日：排名 {last['原排名']}→{last['新排名']}，"
                     f"积分 {last['原积分']}→{last['新积分']}"
                 )
+            st.subheader(f"{q_team} 排名变化")
+            _rank_history_chart(sim, q_team)
 
         st.divider()
-        st.subheader("完整世界排名（全体球队）")
-        full_board = _world_rank_board_df(sim)
-        st.caption(f"共 {len(full_board)} 队 · 排名 1–{len(full_board)}，无缺号。")
-        st.dataframe(full_board, use_container_width=True, hide_index=True, height=520)
-        st.download_button(
-            "下载完整世界排名 CSV",
-            full_board.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"fifa_ranks_day{sim.day}_seed{sim.seed}.csv",
-            mime="text/csv",
-            key="dl_tab_ranks",
-        )
+        tab_world, tab_confed = st.tabs(["世界排名表", "大洲排名表"])
+        with tab_world:
+            st.subheader("完整世界排名（全体球队）")
+            full_board = _world_rank_board_df(sim)
+            st.caption(f"共 {len(full_board)} 队 · 排名 1–{len(full_board)}，无缺号。")
+            st.dataframe(full_board, use_container_width=True, hide_index=True, height=520)
+            st.download_button(
+                "下载世界排名 CSV",
+                full_board.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"fifa_ranks_day{sim.day}_seed{sim.seed}.csv",
+                mime="text/csv",
+                key="dl_tab_ranks",
+            )
+        with tab_confed:
+            default_confed = sim.team_map[q_team].confed if q_team else CONFEDS[0]
+            confed_pick = st.selectbox(
+                "选择大洲",
+                CONFEDS,
+                index=CONFEDS.index(default_confed) if default_confed in CONFEDS else 0,
+                format_func=lambda c: CONFED_LABELS.get(c, c),
+                key="confed_rank_board_pick",
+            )
+            confed_board = _confed_rank_board_df(sim, confed_pick)
+            st.subheader(f"{CONFED_LABELS.get(confed_pick, confed_pick)} 大洲排名")
+            st.caption(f"共 {len(confed_board)} 队 · 大洲内排名 1–{len(confed_board)}。")
+            st.dataframe(confed_board, use_container_width=True, hide_index=True, height=520)
+            st.download_button(
+                f"下载{CONFED_LABELS.get(confed_pick, confed_pick)}排名 CSV",
+                confed_board.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"confed_ranks_{confed_pick}_day{sim.day}_seed{sim.seed}.csv",
+                mime="text/csv",
+                key="dl_tab_confed_ranks",
+            )
 
         if sim.last_day_ranking_delta:
             st.subheader(f"最近一个比赛日（第 {sim.day} 日）参赛队变化")
@@ -2487,7 +3192,48 @@ def main() -> None:
             format_func=lambda k: BRACKET_CUP_LABELS[k],
             key="bracket_cup",
         )
-        if pick_cup in CONTINENTAL_CODES:
+        if pick_cup == "WSC":
+            st.caption(
+                "世界超级杯：世界冠军杯四强 + 世界联赛杯冠亚军 + 世界协会杯冠军"
+                " + 其余球队中世界排名最高者，共 8 队。开赛一次性锁定全部签位。"
+                "附加赛第一轮：一档联赛冠亚军（主场）抽签对阵二档（协会冠军+排名递补，客场）；"
+                "附加赛第二轮：一档冠军杯 3–4 名（主场）对阵第一轮胜者（客场）；"
+                "半决赛/决赛中立场，冠军杯冠、亚军分镇上下半区。淘汰赛积分只加不扣。"
+            )
+            if not getattr(sim, "_wsc_slots", None):
+                st.info("尚无世界超级杯签表（需先完成三大杯决赛）。")
+            else:
+                st.dataframe(
+                    _wsc_knockout_slots_df(sim),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                with st.expander("文字对阵", expanded=False):
+                    st.code("\n".join(_wsc_knockout_bracket_text(sim)), language=None)
+                bracket_page = _wsc_knockout_bracket_html(sim)
+                if bracket_page:
+                    _render_bracket_html(bracket_page, height=580)
+        elif pick_cup == "CC":
+            st.caption(
+                "联合会杯：四大洲杯四强 16 队分 4 组（一档欧洲/二档美洲/三档非洲/四档亚太），"
+                "小组前二进八强；1/4决赛交叉（A1-B2、C1-D2、B1-A2、D1-C2）→ 半决赛 → 决赛。"
+                "淘汰赛阶段国际积分只加不扣。"
+            )
+            rounds = _cc_knockout_rounds(sim)
+            if not getattr(sim, "_cc_groups", None):
+                st.info("尚无该杯淘汰赛签表（需先完成联合会杯分组抽签）。")
+            else:
+                st.dataframe(
+                    _cc_knockout_slots_df(sim, rounds),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                with st.expander("文字对阵", expanded=False):
+                    st.code("\n".join(_cc_knockout_bracket_text(sim, rounds)), language=None)
+                bracket_page = _cc_knockout_bracket_html(sim, rounds)
+                if bracket_page:
+                    _render_bracket_html(bracket_page, height=620)
+        elif pick_cup in CONTINENTAL_CODES:
             st.caption(
                 "洲际杯正赛：分组抽签后即生成完整淘汰赛签表占位；"
                 "小组赛结束后填入队名，每轮赛果确定后继续填入下一轮。"

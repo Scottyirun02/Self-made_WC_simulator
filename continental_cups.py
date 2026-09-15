@@ -237,34 +237,42 @@ def draw_playoff_ties(
 
 def draw_finals_groups(
     host: Any,
-    direct_others: List[Any],
+    gw_top7: List[Any],
+    gw_rest2: List[Any],
+    direct_rest: List[Any],
     pot4_fixed: List[Any],
     rng: random.Random,
 ) -> Tuple[List[List[Any]], List[List[str]]]:
     """
-    东道主固定 A1（一档）；直通队按世界排名入一二三四档；
-    附加赛晋级的 4 队固定进入第四档。
+    东道主固定 A1（一档）；预选赛 9 个小组第一中公平战绩最好的 7 队进一档，
+    其余 2 个小组第一进二档；二档其余 6 席、三档 8 席、四档 4 席按世界排名
+    由剩余直通队依次填充；附加赛晋级的 4 队固定进入第四档。
     """
     if len(pot4_fixed) != 4:
         raise ValueError(f"need 4 playoff winners in pot 4, got {len(pot4_fixed)}")
-    if len(direct_others) != 27:
-        raise ValueError(f"need 27 direct non-host teams, got {len(direct_others)}")
-    fixed_names = {t.name for t in pot4_fixed}
-    if host.name in fixed_names:
-        raise ValueError("host cannot be a playoff winner pot")
-    rest = sorted(
-        [t for t in direct_others if t.name not in fixed_names],
-        key=lambda t: t.world_rank,
-    )
-    if len(rest) != 27:
-        raise ValueError(f"direct others overlap playoff winners: got {len(rest)}")
+    if len(gw_top7) != 7:
+        raise ValueError(f"need 7 top group winners in pot 1, got {len(gw_top7)}")
+    if len(gw_rest2) != 2:
+        raise ValueError(f"need 2 remaining group winners in pot 2, got {len(gw_rest2)}")
+    if len(direct_rest) != 18:
+        raise ValueError(f"need 18 direct non-winner teams, got {len(direct_rest)}")
+    seen = {host.name}
+    for label, batch in (
+        ("gw_top7", gw_top7),
+        ("gw_rest2", gw_rest2),
+        ("direct_rest", direct_rest),
+        ("pot4_fixed", pot4_fixed),
+    ):
+        for t in batch:
+            if t.name in seen:
+                raise ValueError(f"{label}: duplicate team {t.name}")
+            seen.add(t.name)
 
-    # 一档其余 7 + 二档 8 + 三档 8 + 四档直通 4；附加赛 4 队固定四档
-    pot1_rest = rest[:7]
-    pot2 = rest[7:15]
-    pot3 = rest[15:23]
-    pot4_rest = rest[23:27]
-    pot4 = pot4_rest + list(pot4_fixed)
+    rest = sorted(direct_rest, key=lambda t: t.world_rank)
+    pot1_rest = list(gw_top7)
+    pot2 = list(gw_rest2) + rest[:6]
+    pot3 = rest[6:14]
+    pot4 = rest[14:18] + list(pot4_fixed)
 
     groups: List[List[Any]] = [[] for _ in range(8)]
     groups[0].append(host)  # A1
